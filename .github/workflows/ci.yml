@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A separate cache: this job resolves a different feature set from the
+          # one above, and sharing a cache would thrash both.
+          key: metal
+      # Compiles the Metal path and stops there. MTLCreateSystemDefaultDevice
+      # returns nil inside a hosted macOS runner, so nothing here can dispatch a
+      # kernel. Kernels are checked against their CPU reference in the job above
+      # and on real hardware with `make test-metal`.
+      - run: cargo clippy --all-targets --features metal -- -D warnings

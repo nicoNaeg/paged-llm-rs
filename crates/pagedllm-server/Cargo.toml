@@ -1,0 +1,18 @@
+[package]
+name = "pagedllm-server"
+description = "OpenAI-compatible HTTP server for the pagedllm engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pagedllm = { path = "../pagedllm" }
+
+[features]
+metal = ["pagedllm/metal"]
+
+[lints]
+workspace = true

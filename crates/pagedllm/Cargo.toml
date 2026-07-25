@@ -1,0 +1,20 @@
+[package]
+name = "pagedllm"
+description = "LLM inference engine: paged KV cache, continuous batching, hand-written attention kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+candle-core = { workspace = true }
+
+[features]
+# The Apple GPU path. Off by default so the crate builds and tests on any
+# machine, which is what CI runs: GitHub's macOS runners have no Metal device.
+metal = ["candle-core/metal"]
+
+[lints]
+workspace = true

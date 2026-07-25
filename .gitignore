@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# Model weights and tokenizers, downloaded rather than committed
+/models/
+
+# Benchmark and profiler output
+/bench-results/
+*.trace
+*.stacks
+/flamegraph.svg
+
+# OS
+.DS_Store
