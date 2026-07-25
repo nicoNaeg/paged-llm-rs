@@ -79,7 +79,19 @@ Against the f32 reference, bf16 moves the greedy token at 2 of the 10 positions 
 
 So the test asserts the thing that distinguishes a bug from arithmetic. It measures how far the logits of two bf16 runs sit apart, and requires that any position where they disagree is one the reference itself decided by less than that. A rounding difference flips ties and nothing else; a defect flips a position that was not close. Six of the ten positions are decided by more than the measured noise, so the assertion has something to hold.
 
-Each of these tests was checked to fail with the defect it exists for put back: the query and key norms removed, applied after the rotation instead of before, the key heads interleaved rather than grouped, the rotary halves paired the other way, and the two MLP branches swapped. All five are caught, by both the committed fixture and the full-scale comparison. A test that has never failed is not evidence.
+A test that has never failed is not evidence, so the tests are tested. `scripts/mutate.py` puts each defect back into the source, runs the suites, and restores it:
+
+    make mutate
+
+    mutation                                                              fixture  reference
+    ----------------------------------------------------------------------------------------
+    query and key norms dropped, the Llama-shaped attention                caught     caught
+    query and key norms applied after the rotation instead of before       caught     caught
+    key heads interleaved across query heads instead of grouped            caught     caught
+    rotary halves paired the other way round                               caught     caught
+    the MLP gate and up branches swapped                                   caught     caught
+
+It refuses to start on a working tree with uncommitted changes to the files it rewrites, restores them whether the run passed, failed or crashed, and reports a mutation whose anchor has moved as a failure rather than skipping it, since a mutation that no longer applies is one nothing is checking.
 
 ## Build order
 
@@ -121,6 +133,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make server      start the server
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device
+    make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets
 
 The full-scale comparison needs three things the repository does not carry, in this order:
