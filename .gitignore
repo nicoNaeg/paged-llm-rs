@@ -4,6 +4,9 @@
 # Model weights and tokenizers, downloaded rather than committed
 /models/
 
+# Virtualenv for the reference dump script
+/.venv/
+
 # Benchmark and profiler output
 /bench-results/
 *.trace

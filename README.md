@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: bootstrap.** The workspace, the lints, the CI and the device layer are in place. Nothing below the build order is built yet, and this README carries no performance number until a committed benchmark produces one.
+**Status: stage 1 of 8 built.** The model's forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary. No throughput number appears below yet, because nothing here has been benchmarked and no number belongs in this file without the command that reproduces it.
 
 ## Design
 
@@ -51,11 +51,41 @@ Everything above it is written here, including the model's forward pass. That la
 
 Every kernel ships with a CPU implementation. It is the oracle the GPU version is checked against, and it is also the only path CI can execute: `MTLCreateSystemDefaultDevice` returns nil inside GitHub's hosted macOS runners, so a hosted job compiles the Metal path and stops there.
 
+## The forward pass, and how it is known to be right
+
+Qwen3 differs from Llama in three ways that do not fail loudly. An RMS norm is applied to the query and key vectors, per head, before the rotation. The head width is a field of its own rather than `hidden_size / num_attention_heads`, and on Qwen3-0.6B those disagree: 128 against 64, which is why `q_proj` is 1024 by 2048 and not square. And sixteen query heads read eight key heads, so how the groups are expanded decides which head reads which. Get any of them wrong and the model loads, runs, and writes fluent text that the checkpoint did not mean.
+
+So the check is not the logits. It is every module boundary, against activations dumped from the HuggingFace implementation by `scripts/dump_reference.py`, at two scales that answer different questions.
+
+The small one is two layers at toy widths with weights from a fixed seed, and it is committed under `crates/pagedllm/tests/fixtures/tiny`. Its widths are chosen against specific mistakes: the head width is 16 where the quotient is 8, the grouping ratio is 2, and no matrix is square, so a transposed weight cannot pass by accident. At 184 KB it runs in CI on the CPU path, which is what makes structural correctness something the repository checks rather than something this file claims.
+
+    make fixtures && cargo test
+
+The full-scale one is Qwen3-0.6B itself, 452 tensors across 28 layers, not committed because the checkpoint is 1.5 GB.
+
+    make venv model reference test-model
+
+| what runs | against | worst relative difference |
+|-----------|---------|---------------------------|
+| f32 on the CPU | f32 reference | 9.368e-6 |
+| f32 on Metal | f32 reference | 9.882e-6 |
+| bf16 on Metal | bf16 reference | 6.800e-2 |
+
+The first two rows are the point of the third. Holding the dtype at f32 and changing only the backend moves nothing, so the implementation is right on both and the gap in bf16 belongs to the dtype rather than to the code. Reading the bf16 row without them would leave that undecided.
+
+### What bf16 costs, and why the test does not assert tokens match
+
+Against the f32 reference, bf16 moves the greedy token at 2 of the 10 positions in the test prompt. That is not a defect and it is not hidden: the two positions it moves are the ones where the top two logits sit 0.075 and 0.071 apart, while every position the two agree on is decided by 0.49 or more, and the position generation would actually consume is decided by 8.36.
+
+So the test asserts the thing that distinguishes a bug from arithmetic. It measures how far the logits of two bf16 runs sit apart, and requires that any position where they disagree is one the reference itself decided by less than that. A rounding difference flips ties and nothing else; a defect flips a position that was not close. Six of the ten positions are decided by more than the measured noise, so the assertion has something to hold.
+
+Each of these tests was checked to fail with the defect it exists for put back: the query and key norms removed, applied after the rotation instead of before, the key heads interleaved rather than grouped, the rotary halves paired the other way, and the two MLP branches swapped. All five are caught, by both the committed fixture and the full-scale comparison. A test that has never failed is not evidence.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
 
-1. **Model forward pass** (planned): safetensors loading, RMSNorm, RoPE, grouped-query attention, SwiGLU, on candle primitives. Checked against a reference implementation's logits on the same weights.
+1. **Model forward pass** (built): safetensors loading, RMSNorm, RoPE, grouped-query attention with the query and key norms Qwen3 adds, SwiGLU, on candle primitives. Checked against the reference implementation at every module boundary.
 2. **Server** (planned): OpenAI-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time.
 3. **Continuous batching, contiguous cache** (planned): the queue, the scheduler and the step loop, against a KV cache that is still one reserved buffer per sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
 4. **Block allocator** (planned): the paged layout as pure logic, no GPU involved, allocation, release, reference counting and block tables, fully unit tested.
@@ -76,9 +106,12 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
 
 ## Repository layout
 
-    crates/pagedllm/         engine: model, scheduler, block allocator, kernels
-    crates/pagedllm-server/  OpenAI-compatible HTTP server
-    Makefile                 build, test and lint entry points
+    crates/pagedllm/            engine: model, scheduler, block allocator, kernels
+    crates/pagedllm/src/model/  the Qwen3 forward pass on candle primitives
+    crates/pagedllm/tests/      the comparison against the reference, and its fixture
+    crates/pagedllm-server/     OpenAI-compatible HTTP server
+    scripts/                    the reference dump the tests are checked against
+    Makefile                    build, test and lint entry points
 
 ## Development
 
@@ -89,6 +122,15 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device
     make lint        rustfmt check, then clippy with warnings denied on both feature sets
+
+The full-scale comparison needs three things the repository does not carry, in this order:
+
+    make venv        a virtualenv with torch and transformers, for the oracle
+    make model       Qwen3-0.6B from HuggingFace, 1.5 GB
+    make reference   the reference activations, dumped in f32 and in bf16
+    make test-model  the comparison itself
+
+`make fixtures` regenerates the committed small fixture, so a change to the oracle becomes a change to the repository rather than to one machine.
 
 ## License
 

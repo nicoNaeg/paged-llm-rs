@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 candle-core = { workspace = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [features]
 # The Apple GPU path. Off by default so the crate builds and tests on any
@@ -18,3 +20,6 @@ metal = ["candle-core/metal"]
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.151"

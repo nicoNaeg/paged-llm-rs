@@ -1,4 +1,9 @@
-.PHONY: build server test test-metal bench lint fmt
+.PHONY: build server test test-metal test-model bench lint fmt venv model fixtures reference
+
+MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
+REFERENCE ?= $(CURDIR)/models/reference
+PYTHON    ?= $(CURDIR)/.venv/bin/python
+HF        ?= https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main
 
 build:
 	cargo build --release --features metal
@@ -15,6 +20,15 @@ test:
 test-metal:
 	cargo test --features metal
 
+# The full-scale comparison against the reference implementation. Needs the
+# checkpoint and both reference dumps, which are not in the repository; `make
+# model reference` produces them.
+test-model:
+	PAGEDLLM_MODEL_DIR=$(MODEL) \
+	PAGEDLLM_REFERENCE_DIR=$(REFERENCE) \
+	PAGEDLLM_REFERENCE_BF16_DIR=$(REFERENCE)-bf16 \
+	cargo test --release --features metal --test reference_model -- --nocapture
+
 bench:
 	cargo bench
 
@@ -26,3 +40,25 @@ lint:
 fmt:
 	cargo fmt --all
 	cargo clippy --all-targets --fix --allow-dirty
+
+# Everything below produces what the tests read and is not committed: torch and
+# transformers for the oracle, 1.5 GB of weights, and the dumps taken from them.
+venv:
+	python3 -m venv .venv
+	$(PYTHON) -m pip install --quiet --upgrade pip
+	$(PYTHON) -m pip install --quiet torch transformers
+
+model:
+	mkdir -p $(MODEL)
+	cd $(MODEL) && for f in config.json model.safetensors tokenizer.json tokenizer_config.json generation_config.json; do \
+		curl -fsSL -o $$f $(HF)/$$f; \
+	done
+
+# Regenerates the fixture that is committed, so a change to the oracle is a
+# change to the repository rather than to one machine.
+fixtures:
+	$(PYTHON) scripts/dump_reference.py tiny crates/pagedllm/tests/fixtures/tiny
+
+reference:
+	$(PYTHON) scripts/dump_reference.py real $(MODEL) $(REFERENCE) float32
+	$(PYTHON) scripts/dump_reference.py real $(MODEL) $(REFERENCE)-bf16 bfloat16

@@ -24,6 +24,9 @@ pedantic = { level = "warn", priority = -1 }
 # Fire on nearly every public item and buy nothing on an application crate.
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+# Every cast this fires on is a tensor dimension or a token position, bounded by
+# what fits in memory and so far below the 53 bits an f64 carries exactly.
+cast_precision_loss = "allow"
 
 [profile.release]
 # Profiles are taken on release builds and need symbols to resolve.

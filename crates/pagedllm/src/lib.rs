@@ -11,7 +11,13 @@
 //! synchronous engine stays testable and profilable without a runtime.
 
 pub mod backend;
+pub mod config;
 pub mod error;
+pub mod model;
+pub mod weights;
 
 pub use backend::Backend;
+pub use config::Config;
 pub use error::{Error, Result};
+pub use model::{Model, Trace};
+pub use weights::Weights;
