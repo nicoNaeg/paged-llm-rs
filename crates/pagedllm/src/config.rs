@@ -160,6 +160,76 @@ impl Config {
     }
 }
 
+/// What `generation_config.json` says about how the model should be run.
+///
+/// Read and used rather than ignored, which is what the reference server does
+/// too. Qwen3 asks for temperature 0.6, top-p 0.95 and top-k 20, and serving it
+/// at the `OpenAI` default of temperature 1 would answer a noticeably different
+/// question than the model was tuned for. A request that names a parameter
+/// still wins.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationConfig {
+    /// Token ids that end a generation. There may be several.
+    pub eos_token_ids: Vec<u32>,
+    /// The temperature the model was tuned to be served at.
+    pub temperature: Option<f32>,
+    /// The nucleus threshold the model asks for.
+    pub top_p: Option<f32>,
+    /// How many candidates the model asks to draw from.
+    pub top_k: Option<usize>,
+}
+
+impl GenerationConfig {
+    /// Read `generation_config.json`, falling back to the `eos_token_id` in
+    /// `config.json` when there is none.
+    pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let generation = read_json(&dir.join("generation_config.json")).ok();
+        let eos = generation
+            .as_ref()
+            .and_then(|g| token_ids(g.get("eos_token_id")))
+            .or_else(|| {
+                read_json(&dir.join("config.json"))
+                    .ok()
+                    .and_then(|c| token_ids(c.get("eos_token_id")))
+            })
+            .unwrap_or_default();
+
+        let number = |key: &str| -> Option<f64> { generation.as_ref()?.get(key)?.as_f64() };
+        Ok(Self {
+            eos_token_ids: eos,
+            #[allow(clippy::cast_possible_truncation)]
+            temperature: number("temperature").map(|v| v as f32),
+            #[allow(clippy::cast_possible_truncation)]
+            top_p: number("top_p").map(|v| v as f32),
+            top_k: number("top_k").and_then(|v| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Some(v as usize).filter(|k| *k > 0)
+            }),
+        })
+    }
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let text = fs::read_to_string(path).map_err(|e| Error::Io(path.into(), e))?;
+    serde_json::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+}
+
+/// One id, or a list of them, or nothing.
+fn token_ids(value: Option<&serde_json::Value>) -> Option<Vec<u32>> {
+    match value? {
+        serde_json::Value::Number(n) => Some(vec![u32::try_from(n.as_u64()?).ok()?]),
+        serde_json::Value::Array(items) => {
+            let ids: Vec<u32> = items
+                .iter()
+                .filter_map(|v| u32::try_from(v.as_u64()?).ok())
+                .collect();
+            (!ids.is_empty()).then_some(ids)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
-use pagedllm::{Config, Model, Trace, Weights};
+use pagedllm::{Config, KvCache, Model, Trace, Weights};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
@@ -71,7 +71,7 @@ fn every_module_matches_the_reference_implementation() {
     let want = reference(&fixture_dir());
 
     let mut trace = Trace::recording();
-    model.forward_traced(&prompt, 0, &mut trace).unwrap();
+    model.forward_traced(&prompt, 0, None, &mut trace).unwrap();
 
     // The reference dumps `self_attn.out` and `o_proj.out` as the same buffer,
     // so every fixture key must be reachable; a trace that quietly stopped
@@ -121,6 +121,61 @@ fn the_logits_match_and_the_argmax_agrees() {
             .unwrap()
     };
     assert_eq!(argmax(&logits), argmax(expected));
+}
+
+/// Decoding one token at a time through the cache has to land exactly where one
+/// pass over the whole prompt lands.
+///
+/// This is the invariant the cache exists under, and it is the one that breaks
+/// quietly: a rotation applied at the wrong offset, a mask that forgot the
+/// history, or keys cached before they were rotated all still produce logits.
+/// Only the comparison says they are the wrong ones.
+#[test]
+fn feeding_tokens_one_at_a_time_through_the_cache_changes_nothing() {
+    let (model, prompt, tolerance) = load_tiny();
+    let whole = model.forward(&prompt).unwrap();
+
+    let mut cache = KvCache::new(model.config().num_hidden_layers);
+    let mut last = None;
+    for (position, token) in prompt.iter().enumerate() {
+        let step = model.forward_cached(&[*token], &mut cache).unwrap();
+        assert_eq!(
+            cache.tokens(),
+            position + 1,
+            "cache length after {position}"
+        );
+        last = Some(step);
+    }
+
+    // The final step's logits are the last row of the single-pass run.
+    let want = whole.narrow(1, prompt.len() - 1, 1).unwrap();
+    let (worst, scale) = compare(&last.unwrap(), &want);
+    assert!(
+        f64::from(worst) <= tolerance,
+        "off by {worst:.3e} on values up to {scale:.3e}"
+    );
+}
+
+/// The same, splitting the prompt into two uneven chunks rather than into single
+/// tokens, which is what a prefill followed by decoding actually does.
+#[test]
+fn a_prompt_split_into_chunks_lands_where_one_pass_does() {
+    let (model, prompt, tolerance) = load_tiny();
+    let whole = model.forward(&prompt).unwrap();
+
+    let mut cache = KvCache::new(model.config().num_hidden_layers);
+    let split = prompt.len() - 3;
+    model.forward_cached(&prompt[..split], &mut cache).unwrap();
+    assert_eq!(cache.tokens(), split);
+    let rest = model.forward_cached(&prompt[split..], &mut cache).unwrap();
+    assert_eq!(cache.tokens(), prompt.len());
+
+    let want = whole.narrow(1, split, prompt.len() - split).unwrap();
+    let (worst, scale) = compare(&rest, &want);
+    assert!(
+        f64::from(worst) <= tolerance,
+        "off by {worst:.3e} on values up to {scale:.3e}"
+    );
 }
 
 #[test]

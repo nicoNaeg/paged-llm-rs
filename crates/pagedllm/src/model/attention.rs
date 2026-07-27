@@ -6,6 +6,7 @@ use super::Trace;
 use super::layers::{Linear, RmsNorm};
 use super::rope::Rope;
 use crate::Result;
+use crate::cache::KvCache;
 
 /// One attention block.
 #[derive(Debug)]
@@ -62,6 +63,7 @@ impl Attention {
         x: &Tensor,
         rope: &Rope,
         offset: usize,
+        cache: Option<(&mut KvCache, usize)>,
         trace: &mut Trace,
         prefix: &str,
     ) -> Result<Tensor> {
@@ -90,13 +92,21 @@ impl Attention {
         let q = rope.apply(&q, offset)?;
         let k = rope.apply(&k, offset)?;
 
+        // Cached after the rotation, never before: the rotation depends on the
+        // absolute position, so caching raw keys would mean rotating the whole
+        // history again on every step, which is what the cache exists to avoid.
+        let (k, v) = match cache {
+            Some((cache, layer)) => cache.append(layer, &k, &v)?,
+            None => (k, v),
+        };
+
         let group = self.num_heads / self.num_kv_heads;
         let k = repeat_kv(&k, group)?;
         let v = repeat_kv(&v, group)?;
 
+        let keys = k.dim(D::Minus2)?;
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * self.scale)?;
-        let scores =
-            scores.broadcast_add(&causal_mask(seq, offset, scores.dtype(), x.device())?)?;
+        let scores = scores.broadcast_add(&causal_mask(seq, keys, scores.dtype(), x.device())?)?;
         let weights = softmax_last_dim(&scores)?;
 
         let out = weights.matmul(&v)?;
@@ -128,13 +138,17 @@ fn repeat_kv(x: &Tensor, group: usize) -> Result<Tensor> {
 }
 
 /// Additive mask forbidding a query at position `i` from reading a key past it.
+///
+/// The offset is derived from the two lengths rather than taken as an argument.
+/// The number of keys is whatever the cache actually holds, and computing where
+/// the queries sit from it means a cache and a mask cannot disagree.
 fn causal_mask(
     seq: usize,
-    offset: usize,
+    keys: usize,
     dtype: DType,
     device: &candle_core::Device,
 ) -> Result<Tensor> {
-    let keys = offset + seq;
+    let offset = keys - seq;
     let mut mask = Vec::with_capacity(seq * keys);
     for query in 0..seq {
         for key in 0..keys {

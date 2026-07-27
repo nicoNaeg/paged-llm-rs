@@ -11,13 +11,27 @@
 //! synchronous engine stays testable and profilable without a runtime.
 
 pub mod backend;
+pub mod cache;
+pub mod chat;
 pub mod config;
 pub mod error;
 pub mod model;
+pub mod sampler;
+pub mod session;
+pub mod tokenizer;
 pub mod weights;
 
+// Re-exported so a crate that drives this engine names a device without taking
+// a direct dependency on the tensor library underneath it.
+pub use candle_core::{DType, Device};
+
 pub use backend::Backend;
-pub use config::Config;
+pub use cache::KvCache;
+pub use chat::ChatTemplate;
+pub use config::{Config, GenerationConfig};
 pub use error::{Error, Result};
 pub use model::{Model, Trace};
+pub use sampler::{Rng, Sampling};
+pub use session::{Finish, Request, Session};
+pub use tokenizer::{IncrementalDecoder, Tokenizer};
 pub use weights::Weights;

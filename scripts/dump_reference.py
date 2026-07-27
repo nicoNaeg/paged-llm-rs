@@ -148,6 +148,70 @@ def dump(model: Qwen3ForCausalLM, prompt: list[int], out_dir: Path, tolerance: f
     print(f"wrote {len(captured)} tensors to {out_dir}")
 
 
+# Conversations chosen for the branches they reach in the template, not for
+# their content: a bare turn, a system prompt, several turns, and an assistant
+# turn carrying a reasoning block, which the template pulls apart and rebuilds.
+CHAT_CASES = {
+    "single_turn": [{"role": "user", "content": "What is a series?"}],
+    "with_system": [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "Hello"},
+    ],
+    "multi_turn": [
+        {"role": "user", "content": "A"},
+        {"role": "assistant", "content": "B"},
+        {"role": "user", "content": "C"},
+    ],
+    "with_reasoning": [
+        {"role": "user", "content": "A"},
+        {"role": "assistant", "content": "<think>\nweighing it up\n</think>\n\nB"},
+        {"role": "user", "content": "C"},
+    ],
+    "unicode": [{"role": "user", "content": "Décris un caractère: 漢字 et 🌍"}],
+}
+
+
+def dump_chat(model_dir: Path, out_dir: Path) -> None:
+    """Commit the chat template and what transformers renders it to.
+
+    The template is 4 KB of Jinja and the renderings are a few more, so unlike
+    the weights this fits in the repository. That is what lets CI catch a
+    template engine that stops agreeing with the reference, which is the whole
+    risk in handing this job to a crate.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    template = json.loads((model_dir / "tokenizer_config.json").read_text())["chat_template"]
+
+    renderings = {}
+    for name, messages in CHAT_CASES.items():
+        for add_generation_prompt in (True, False):
+            # None leaves enable_thinking undefined, which is not the same as
+            # passing true: the template tests whether it is defined at all.
+            for thinking in (None, True, False):
+                key = f"{name}|{add_generation_prompt}|{thinking}"
+                kwargs = {} if thinking is None else {"enable_thinking": thinking}
+                renderings[key] = tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    **kwargs,
+                )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "template.jinja").write_text(template)
+    (out_dir / "expected.json").write_text(
+        json.dumps(
+            {"source": str(model_dir), "cases": CHAT_CASES, "renderings": renderings},
+            ensure_ascii=False,
+            indent=1,
+        )
+        + "\n"
+    )
+    print(f"wrote {len(renderings)} renderings to {out_dir}")
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -194,6 +258,11 @@ def main() -> int:
         # correctness gate in bf16 is that the greedy tokens still match.
         tolerance = 5e-5 if dtype is torch.float32 else 1e-1
         dump(model, REAL_PROMPT, out_dir, tolerance=tolerance)
+        return 0
+
+    if mode == "chat":
+        model_dir, out_dir = Path(sys.argv[2]), Path(sys.argv[3])
+        dump_chat(model_dir, out_dir)
         return 0
 
     print(f"unknown mode {mode!r}")

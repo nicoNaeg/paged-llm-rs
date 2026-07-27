@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 1 of 8 built.** The model's forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary. No throughput number appears below yet, because nothing here has been benchmarked and no number belongs in this file without the command that reproduces it.
+**Status: stage 2 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, and an `OpenAI`-compatible server generates from it over HTTP with streaming. The throughput figures below are the single-sequence baseline that the next three stages exist to beat, and every one of them comes with the command that reproduces it.
 
 ## Design
 
@@ -93,12 +93,61 @@ A test that has never failed is not evidence, so the tests are tested. `scripts/
 
 It refuses to start on a working tree with uncommitted changes to the files it rewrites, restores them whether the run passed, failed or crashed, and reports a mutation whose anchor has moved as a failure rather than skipping it, since a mutation that no longer applies is one nothing is checking.
 
+## Serving the `OpenAI` API
+
+    make server
+
+```console
+$ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+    "messages": [{"role": "user", "content": "Name three prime numbers."}],
+    "max_tokens": 64, "temperature": 0,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+{"id":"chatcmpl-...","object":"chat.completion","model":"Qwen3-0.6B",
+ "choices":[{"index":0,"message":{"role":"assistant",
+   "content":"Three prime numbers are **2, 3, and 5**."},"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":17,"completion_tokens":16,"total_tokens":33}}
+```
+
+`/v1/completions`, `/v1/chat/completions`, `/v1/models` and `/health`, with `"stream": true` serving server-sent events terminated by `[DONE]`, which is what every client watches for. The engine runs on its own thread and the HTTP layer reaches it by sending a job and reading events off a channel, so a disconnected client stops costing GPU time at the next token rather than at the end of its budget.
+
+### What is refused, and why that is the feature
+
+`temperature`, `top_p`, `top_k`, `max_tokens`, `seed` and `stream` are honoured. Everything else the schema allows is parsed in order to be refused with a 400 naming it: `n` above one, `stop`, `tools`, `logit_bias`, `logprobs`, `response_format` and the two penalties. A server that accepts `frequency_penalty` and ignores it answers a different question than it was asked, and the client has no way to find out. What a client sends meaning "default" gets through, so `n: 1` and a penalty of zero are not refusals.
+
+The sampling defaults come from the model's own `generation_config.json`, which for Qwen3 is temperature 0.6, top-p 0.95 and top-k 20, and the server prints them at startup. A request that names a parameter still wins. Serving at the `OpenAI` default of temperature 1 instead would answer a noticeably different question than the model was tuned for.
+
+Chat messages are turned into text by the model's own Jinja template, rendered with `minijinja` and the Python compatibility layer its string methods need. This is checked rather than trusted: `crates/pagedllm/tests/fixtures/chat` holds the template and thirty renderings taken from the reference implementation, covering the system prompt, multiple turns, reasoning blocks and Unicode, and the test requires all thirty to match byte for byte. Without the compatibility layer, all thirty fail on the template's first `startswith`.
+
+`enable_thinking` reaches the template through `chat_template_kwargs`, and is left undefined unless a request sets it, which is what the template treats as reasoning turned on. Qwen3 therefore reasons out loud by default, at some length for a model this size. Turning that off silently would be this server quietly answering a different question than the model was asked.
+
+### What one sequence costs
+
+    make smoke
+
+Apple M4 Pro, Metal, Qwen3-0.6B in bf16, one request at a time, greedy prompt of five tokens:
+
+| tokens generated | seconds | tokens/s | ms per token |
+|------------------|---------|----------|--------------|
+| 16 | 0.23 | 71.0 | 14.08 |
+| 64 | 1.00 | 64.1 | 15.61 |
+| 128 | 2.31 | 55.4 | 18.05 |
+| 256 | 5.96 | 43.0 | 23.28 |
+| 512 | 17.26 | 29.7 | 33.71 |
+| 1024 | 56.65 | 18.1 | 55.32 |
+
+Time to first token is 42 ms and the server is reachable 0.9 s after launch.
+
+The shape of that table is the result, not the peak figure. A token costs 14 ms at the start of a sequence and 55 ms a thousand tokens later, four times as much, and both the attention and the cache grow with the sequence. What this measurement does not do is separate them: appending one token to a contiguous cache copies everything already in it, and attending over the cache reads all of it, and both are linear in the length. Stage 6 profiles that; guessing at it here would be the kind of claim this README is written to avoid.
+
+What it is enough to say now is that this is the baseline. The cache is one unbroken run of memory per sequence, grown by reallocating, which is the layout stage 5 replaces with a pool of fixed-size blocks. Measuring it before replacing it is the point of building it this way.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
 
 1. **Model forward pass** (built): safetensors loading, RMSNorm, RoPE, grouped-query attention with the query and key norms Qwen3 adds, SwiGLU, on candle primitives. Checked against the reference implementation at every module boundary.
-2. **Server** (planned): OpenAI-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time.
+2. **Server** (built): `OpenAI`-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time, against a KV cache for one sequence.
 3. **Continuous batching, contiguous cache** (planned): the queue, the scheduler and the step loop, against a KV cache that is still one reserved buffer per sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
 4. **Block allocator** (planned): the paged layout as pure logic, no GPU involved, allocation, release, reference counting and block tables, fully unit tested.
 5. **Paged attention kernel** (planned): the Metal kernel that reads keys and values through a block table, and its integration into the attention layer.
@@ -118,11 +167,11 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
 
 ## Repository layout
 
-    crates/pagedllm/            engine: model, scheduler, block allocator, kernels
+    crates/pagedllm/            engine: model, cache, sampler, scheduler, kernels
     crates/pagedllm/src/model/  the Qwen3 forward pass on candle primitives
-    crates/pagedllm/tests/      the comparison against the reference, and its fixture
-    crates/pagedllm-server/     OpenAI-compatible HTTP server
-    scripts/                    the reference dump the tests are checked against
+    crates/pagedllm/tests/      the comparisons against the reference, and their fixtures
+    crates/pagedllm-server/     OpenAI-compatible HTTP server on axum
+    scripts/                    the reference dumps, the mutation run, the smoke test
     Makefile                    build, test and lint entry points
 
 ## Development
@@ -131,8 +180,10 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
 
     make build       release build with the Metal backend
     make server      start the server
+    make server      start the server on port 8000
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device
+    make smoke       drive the server over HTTP and print its throughput
     make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets
 

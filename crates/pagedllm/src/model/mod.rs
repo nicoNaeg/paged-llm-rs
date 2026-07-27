@@ -14,6 +14,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 
+use crate::cache::KvCache;
 use crate::config::Config;
 use crate::weights::Weights;
 use crate::{Error, Result};
@@ -92,14 +93,20 @@ impl Block {
         x: &Tensor,
         rope: &Rope,
         offset: usize,
+        cache: Option<(&mut KvCache, usize)>,
         trace: &mut Trace,
         prefix: &str,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         trace.record(&format!("{prefix}.input_layernorm.out"), &normed);
-        let attn =
-            self.self_attn
-                .forward(&normed, rope, offset, trace, &format!("{prefix}.self_attn"))?;
+        let attn = self.self_attn.forward(
+            &normed,
+            rope,
+            offset,
+            cache,
+            trace,
+            &format!("{prefix}.self_attn"),
+        )?;
         let x = (x + attn)?;
 
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -233,7 +240,14 @@ impl Model {
 
     /// Logits for one sequence, shaped `[1, tokens.len(), vocab_size]`.
     pub fn forward(&self, tokens: &[u32]) -> Result<Tensor> {
-        self.forward_traced(tokens, 0, &mut Trace::off())
+        self.forward_traced(tokens, 0, None, &mut Trace::off())
+    }
+
+    /// Logits for `tokens`, continuing the sequence whose keys and values are
+    /// already in `cache`, and adding this step's to it.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Tensor> {
+        let offset = cache.tokens();
+        self.forward_traced(tokens, offset, Some(cache), &mut Trace::off())
     }
 
     /// Same, recording every intermediate into `trace`.
@@ -244,6 +258,7 @@ impl Model {
         &self,
         tokens: &[u32],
         offset: usize,
+        cache: Option<&mut KvCache>,
         trace: &mut Trace,
     ) -> Result<Tensor> {
         if tokens.is_empty() {
@@ -255,14 +270,22 @@ impl Model {
         let mut x = self.embed_tokens.index_select(&ids, 0)?.unsqueeze(0)?;
         trace.record("model.embed_tokens.out", &x);
 
+        let mut cache = cache;
         for (layer, block) in self.blocks.iter().enumerate() {
             x = block.forward(
                 &x,
                 &self.rope,
                 offset,
+                cache.as_deref_mut().map(|c| (c, layer)),
                 trace,
                 &format!("model.layers.{layer}"),
             )?;
+        }
+        if let Some(cache) = cache {
+            // Once per pass rather than once per layer: every layer caches the
+            // same positions, so counting per layer would multiply the sequence
+            // length by the depth of the model.
+            cache.advance(tokens.len());
         }
 
         let x = self.norm.forward(&x)?;

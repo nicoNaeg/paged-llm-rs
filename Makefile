@@ -1,4 +1,4 @@
-.PHONY: build server test test-metal test-model mutate bench lint fmt venv model fixtures reference
+.PHONY: build server test test-metal test-model smoke mutate bench lint fmt venv model fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
@@ -9,7 +9,7 @@ build:
 	cargo build --release --features metal
 
 server: build
-	./target/release/pagedllm-server
+	./target/release/pagedllm-server --model $(MODEL)
 
 # The CPU path, which is what CI runs and what every kernel is checked against.
 test:
@@ -28,6 +28,11 @@ test-model:
 	PAGEDLLM_REFERENCE_DIR=$(REFERENCE) \
 	PAGEDLLM_REFERENCE_BF16_DIR=$(REFERENCE)-bf16 \
 	cargo test --release --features metal --test reference_model -- --nocapture
+
+# Drives the server over HTTP, on a process it starts and stops itself, and
+# prints the throughput of one sequence against the contiguous cache.
+smoke: build
+	python3 scripts/smoke-server.py
 
 # Puts each defect the forward-pass tests exist for back, and checks they fail.
 # Adds the full-scale suite when the checkpoint and its reference dumps are

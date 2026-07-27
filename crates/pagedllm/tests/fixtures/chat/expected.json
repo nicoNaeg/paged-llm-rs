@@ -1,0 +1,87 @@
+{
+ "source": "models/Qwen3-0.6B",
+ "cases": {
+  "single_turn": [
+   {
+    "role": "user",
+    "content": "What is a series?"
+   }
+  ],
+  "with_system": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "multi_turn": [
+   {
+    "role": "user",
+    "content": "A"
+   },
+   {
+    "role": "assistant",
+    "content": "B"
+   },
+   {
+    "role": "user",
+    "content": "C"
+   }
+  ],
+  "with_reasoning": [
+   {
+    "role": "user",
+    "content": "A"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nweighing it up\n</think>\n\nB"
+   },
+   {
+    "role": "user",
+    "content": "C"
+   }
+  ],
+  "unicode": [
+   {
+    "role": "user",
+    "content": "Décris un caractère: 漢字 et 🌍"
+   }
+  ]
+ },
+ "renderings": {
+  "single_turn|True|None": "<|im_start|>user\nWhat is a series?<|im_end|>\n<|im_start|>assistant\n",
+  "single_turn|True|True": "<|im_start|>user\nWhat is a series?<|im_end|>\n<|im_start|>assistant\n",
+  "single_turn|True|False": "<|im_start|>user\nWhat is a series?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "single_turn|False|None": "<|im_start|>user\nWhat is a series?<|im_end|>\n",
+  "single_turn|False|True": "<|im_start|>user\nWhat is a series?<|im_end|>\n",
+  "single_turn|False|False": "<|im_start|>user\nWhat is a series?<|im_end|>\n",
+  "with_system|True|None": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+  "with_system|True|True": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+  "with_system|True|False": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "with_system|False|None": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n",
+  "with_system|False|True": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n",
+  "with_system|False|False": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n",
+  "multi_turn|True|None": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n",
+  "multi_turn|True|True": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n",
+  "multi_turn|True|False": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "multi_turn|False|None": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "multi_turn|False|True": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "multi_turn|False|False": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "with_reasoning|True|None": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n",
+  "with_reasoning|True|True": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n",
+  "with_reasoning|True|False": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "with_reasoning|False|None": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "with_reasoning|False|True": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "with_reasoning|False|False": "<|im_start|>user\nA<|im_end|>\n<|im_start|>assistant\nB<|im_end|>\n<|im_start|>user\nC<|im_end|>\n",
+  "unicode|True|None": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n<|im_start|>assistant\n",
+  "unicode|True|True": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n<|im_start|>assistant\n",
+  "unicode|True|False": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "unicode|False|None": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n",
+  "unicode|False|True": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n",
+  "unicode|False|False": "<|im_start|>user\nDécris un caractère: 漢字 et 🌍<|im_end|>\n"
+ }
+}
