@@ -1,23 +1,26 @@
-//! Batching has to be invisible in the answers.
+//! Batching and paging have to be invisible in the answers.
 //!
 //! A sequence decoded next to others must produce exactly what it produces
-//! alone. Everything stage 3 adds can break that quietly: a mask that lets one
-//! row read another's padding, positions taken from the wrong row, a slot
-//! written at the offset of its neighbour. None of them stop the model
-//! producing logits, and none of them are visible in a single sequence.
+//! alone, and a sequence whose history is scattered across blocks must produce
+//! exactly what it produces in one run of memory. Everything these two stages
+//! add can break that quietly: a mask that lets one row read another's padding,
+//! positions taken from the wrong row, a block table resolved to the wrong slot.
+//! None of them stop the model producing logits, and none are visible in a
+//! single sequence held in one block.
 
 use candle_core::{DType, Device, Tensor};
-use pagedllm::{Batch, CacheConfig, Model, SlotCache};
+use pagedllm::{Batch, BlockAllocator, BlockTable, CacheConfig, Model, PagedCache};
 
 mod common;
 use common::{compare, load_tiny};
 
-fn cache_for(model: &Model, slots: usize, max_seq: usize) -> SlotCache {
+/// A pool at the block size under test, and its free list.
+fn pool(model: &Model, block_size: usize, blocks: usize) -> (PagedCache, BlockAllocator) {
     let config = model.config();
-    SlotCache::new(
+    let cache = PagedCache::new(
         CacheConfig {
-            slots,
-            max_seq,
+            block_size,
+            blocks,
             kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             layers: config.num_hidden_layers,
@@ -25,7 +28,15 @@ fn cache_for(model: &Model, slots: usize, max_seq: usize) -> SlotCache {
         DType::F32,
         &Device::Cpu,
     )
-    .unwrap()
+    .unwrap();
+    (cache, BlockAllocator::new(blocks))
+}
+
+/// Give `table` enough blocks for `tokens` more.
+fn grow(allocator: &mut BlockAllocator, table: &mut BlockTable, tokens: usize) {
+    for _ in 0..table.blocks_needed(tokens) {
+        table.push(allocator.allocate().expect("the pool has room"));
+    }
 }
 
 /// Run one sequence alone in its own pool, feeding it `feed` after its prompt.
@@ -33,31 +44,27 @@ fn cache_for(model: &Model, slots: usize, max_seq: usize) -> SlotCache {
 /// The tokens are given rather than sampled. Letting each path pick its own
 /// greedy token would compare two chains instead of two implementations: this
 /// fixture model has a near-uniform output over 128 tokens, so a tie decided
-/// differently by a rounding bit sends the chains apart from that step on, and
-/// the test would report a divergence that says nothing about batching.
-fn alone(model: &Model, prompt: &[u32], feed: &[u32]) -> Vec<Tensor> {
-    let mut cache = cache_for(model, 1, 64);
-    let slot = cache.acquire().unwrap();
-    let mut logits = vec![
-        model
-            .forward_batch(&Batch::prefill(prompt.to_vec(), slot, 0), &cache)
-            .unwrap(),
-    ];
-    cache.advance(&[slot], prompt.len());
+/// differently by a rounding bit sends the chains apart from that step on.
+fn alone(model: &Model, block_size: usize, prompt: &[u32], feed: &[u32]) -> Vec<Tensor> {
+    let (cache, mut allocator) = pool(model, block_size, 64);
+    let mut table = BlockTable::new(block_size);
+    grow(&mut allocator, &mut table, prompt.len());
+
+    let batch = Batch::new(prompt.to_vec(), prompt.len(), &[&table], block_size).unwrap();
+    let mut logits = vec![model.forward_batch(&batch, &cache).unwrap()];
+    table.advance(prompt.len()).unwrap();
+
     for &token in feed {
-        let start = cache.length(slot);
-        logits.push(
-            model
-                .forward_batch(&Batch::decode(vec![token], vec![slot], vec![start]), &cache)
-                .unwrap(),
-        );
-        cache.advance(&[slot], 1);
+        grow(&mut allocator, &mut table, 1);
+        let batch = Batch::new(vec![token], 1, &[&table], block_size).unwrap();
+        logits.push(model.forward_batch(&batch, &cache).unwrap());
+        table.advance(1).unwrap();
     }
     logits
 }
 
 #[test]
-fn a_batched_prefill_lands_where_the_single_sequence_path_lands() {
+fn a_batched_prefill_lands_where_the_uncached_path_lands() {
     let (model, prompt, tolerance) = load_tiny();
     let whole = model.forward(&prompt).unwrap();
     let want = whole
@@ -66,20 +73,40 @@ fn a_batched_prefill_lands_where_the_single_sequence_path_lands() {
         .reshape((1, ()))
         .unwrap();
 
-    let mut cache = cache_for(&model, 1, 32);
-    let slot = cache.acquire().unwrap();
-    let got = model
-        .forward_batch(&Batch::prefill(prompt.clone(), slot, 0), &cache)
-        .unwrap();
-    // The pass writes the slot; recording that it happened is the caller's job,
-    // which in the server is the scheduler's commit.
-    cache.advance(&[slot], prompt.len());
-    assert_eq!(cache.length(slot), prompt.len());
+    let (cache, mut allocator) = pool(&model, 4, 32);
+    let mut table = BlockTable::new(4);
+    grow(&mut allocator, &mut table, prompt.len());
+    let batch = Batch::new(prompt.clone(), prompt.len(), &[&table], 4).unwrap();
+    let got = model.forward_batch(&batch, &cache).unwrap();
+
     let (worst, scale) = compare(&got, &want);
     assert!(
         f64::from(worst) <= tolerance,
         "off by {worst:.3e} on values up to {scale:.3e}"
     );
+}
+
+/// The whole point of paging: where a sequence's history sits must not matter.
+///
+/// A block of four spreads the same history over several blocks, where a block
+/// as wide as the context keeps it in one. Both have to answer identically.
+#[test]
+fn a_history_scattered_across_blocks_answers_what_one_run_of_memory_answers() {
+    let (model, prompt, tolerance) = load_tiny();
+    let feed = [11u32, 42, 3, 64];
+
+    // A block as wide as the context is one block a sequence, which is the
+    // reservation stage 3 measured.
+    let contiguous = alone(&model, 64, &prompt, &feed);
+    let paged = alone(&model, 4, &prompt, &feed);
+
+    for (step, (want, got)) in contiguous.iter().zip(&paged).enumerate() {
+        let (worst, scale) = compare(got, want);
+        assert!(
+            f64::from(worst) <= tolerance,
+            "step {step} off by {worst:.3e} on values up to {scale:.3e}"
+        );
+    }
 }
 
 #[test]
@@ -91,39 +118,48 @@ fn two_sequences_decoded_together_answer_what_they_answer_apart() {
     let (first, second) = (&prompt[..5], &prompt[2..]);
     assert_ne!(first.len(), second.len());
     let feed = [11u32, 42, 3, 64];
+    let block_size = 4;
 
-    let apart = [alone(&model, first, &feed), alone(&model, second, &feed)];
+    let apart = [
+        alone(&model, block_size, first, &feed),
+        alone(&model, block_size, second, &feed),
+    ];
 
-    let mut cache = cache_for(&model, 2, 64);
-    let slots = [cache.acquire().unwrap(), cache.acquire().unwrap()];
+    let (cache, mut allocator) = pool(&model, block_size, 64);
+    let mut tables = [BlockTable::new(block_size), BlockTable::new(block_size)];
 
     // Prefills run one at a time, which is what the scheduler does: a batch is a
-    // rectangle, and two prompts of different lengths are not one.
+    // rectangle, and two prompts of different lengths are not one. Allocating in
+    // turn is also what interleaves the two sequences' blocks.
     let mut together = Vec::new();
-    for (tokens, slot) in [first, second].iter().zip(slots) {
-        together.push(
-            model
-                .forward_batch(&Batch::prefill(tokens.to_vec(), slot, 0), &cache)
-                .unwrap(),
-        );
-        cache.advance(&[slot], tokens.len());
+    for (tokens, table) in [first, second].iter().zip(&mut tables) {
+        grow(&mut allocator, table, tokens.len());
+        let batch = Batch::new(tokens.to_vec(), tokens.len(), &[table], block_size).unwrap();
+        together.push(model.forward_batch(&batch, &cache).unwrap());
+        table.advance(tokens.len()).unwrap();
     }
+    assert_ne!(
+        tables[0].blocks(),
+        tables[1].blocks(),
+        "the two sequences must not hold the same blocks"
+    );
 
     let mut batched = Vec::new();
     for &token in &feed {
-        let starts: Vec<usize> = slots.iter().map(|&s| cache.length(s)).collect();
+        for table in &mut tables {
+            grow(&mut allocator, table, 1);
+        }
+        let refs: Vec<&BlockTable> = tables.iter().collect();
         assert_ne!(
-            starts[0], starts[1],
+            refs[0].tokens(),
+            refs[1].tokens(),
             "the rows must sit at different lengths"
         );
-        let logits = model
-            .forward_batch(
-                &Batch::decode(vec![token; 2], slots.to_vec(), starts),
-                &cache,
-            )
-            .unwrap();
-        cache.advance(&slots, 1);
-        batched.push(logits);
+        let batch = Batch::new(vec![token; 2], 1, &refs, block_size).unwrap();
+        batched.push(model.forward_batch(&batch, &cache).unwrap());
+        for table in &mut tables {
+            table.advance(1).unwrap();
+        }
     }
 
     let mut failures = Vec::new();
@@ -145,76 +181,23 @@ fn two_sequences_decoded_together_answer_what_they_answer_apart() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Feeding a prompt one token at a time has to land where one pass lands.
-///
-/// The invariant the cache exists under, and the one that breaks quietly: a
-/// rotation applied at the wrong offset, a mask that forgot the history, or keys
-/// written at a neighbour's position all still produce logits.
 #[test]
 fn feeding_tokens_one_at_a_time_lands_where_one_pass_does() {
     let (model, prompt, tolerance) = load_tiny();
-    let mut whole_cache = cache_for(&model, 1, 32);
-    let whole_slot = whole_cache.acquire().unwrap();
+    let block_size = 4;
+
+    let (cache, mut allocator) = pool(&model, block_size, 64);
+    let mut whole = BlockTable::new(block_size);
+    grow(&mut allocator, &mut whole, prompt.len());
     let want = model
-        .forward_batch(&Batch::prefill(prompt.clone(), whole_slot, 0), &whole_cache)
-        .unwrap();
-    whole_cache.advance(&[whole_slot], prompt.len());
-
-    let mut cache = cache_for(&model, 1, 32);
-    let slot = cache.acquire().unwrap();
-    let mut got = None;
-    for (position, token) in prompt.iter().enumerate() {
-        got = Some(
-            model
-                .forward_batch(
-                    &Batch::decode(vec![*token], vec![slot], vec![position]),
-                    &cache,
-                )
-                .unwrap(),
-        );
-        cache.advance(&[slot], 1);
-        assert_eq!(cache.length(slot), position + 1);
-    }
-
-    let (worst, scale) = compare(&got.unwrap(), &want);
-    assert!(
-        f64::from(worst) <= tolerance,
-        "off by {worst:.3e} on values up to {scale:.3e}"
-    );
-}
-
-/// The same, in two uneven chunks, which is a prefill followed by decoding.
-#[test]
-fn a_prompt_split_into_chunks_lands_where_one_pass_does() {
-    let (model, prompt, tolerance) = load_tiny();
-    let mut whole_cache = cache_for(&model, 1, 32);
-    let whole_slot = whole_cache.acquire().unwrap();
-    let want = model
-        .forward_batch(&Batch::prefill(prompt.clone(), whole_slot, 0), &whole_cache)
+        .forward_batch(
+            &Batch::new(prompt.clone(), prompt.len(), &[&whole], block_size).unwrap(),
+            &cache,
+        )
         .unwrap();
 
-    let mut cache = cache_for(&model, 1, 32);
-    let slot = cache.acquire().unwrap();
-    let split = prompt.len() - 3;
-    model
-        .forward_batch(&Batch::prefill(prompt[..split].to_vec(), slot, 0), &cache)
-        .unwrap();
-    cache.advance(&[slot], split);
-
-    let mut got = None;
-    for (offset, token) in prompt[split..].iter().enumerate() {
-        got = Some(
-            model
-                .forward_batch(
-                    &Batch::decode(vec![*token], vec![slot], vec![split + offset]),
-                    &cache,
-                )
-                .unwrap(),
-        );
-        cache.advance(&[slot], 1);
-    }
-
-    let (worst, scale) = compare(&got.unwrap(), &want);
+    let one_by_one = alone(&model, block_size, &prompt[..1], &prompt[1..]);
+    let (worst, scale) = compare(one_by_one.last().unwrap(), &want);
     assert!(
         f64::from(worst) <= tolerance,
         "off by {worst:.3e} on values up to {scale:.3e}"
@@ -222,58 +205,52 @@ fn a_prompt_split_into_chunks_lands_where_one_pass_does() {
 }
 
 #[test]
-fn a_finished_sequence_gives_its_slot_back_and_the_next_one_starts_clean() {
+fn a_finished_sequence_gives_its_blocks_back_and_the_next_one_starts_clean() {
     let (model, prompt, tolerance) = load_tiny();
-    let mut cache = cache_for(&model, 1, 32);
+    let block_size = 4;
+    // Exactly enough blocks for one sequence, so the second can only run if the
+    // first really gave them back.
+    let blocks = prompt.len().div_ceil(block_size);
+    let (cache, mut allocator) = pool(&model, block_size, blocks);
 
-    let slot = cache.acquire().unwrap();
-    let first = model
-        .forward_batch(&Batch::prefill(prompt.clone(), slot, 0), &cache)
-        .unwrap();
-    cache.advance(&[slot], prompt.len());
-    assert_eq!(cache.free_slots(), 0, "the only slot is held");
-    cache.release(slot);
-    assert_eq!(cache.free_slots(), 1);
+    let mut table = BlockTable::new(block_size);
+    grow(&mut allocator, &mut table, prompt.len());
+    let batch = Batch::new(prompt.clone(), prompt.len(), &[&table], block_size).unwrap();
+    let first = model.forward_batch(&batch, &cache).unwrap();
+    table.advance(prompt.len()).unwrap();
+    assert_eq!(allocator.available(), 0);
 
-    // The same prompt into the same slot has to answer the same thing. Anything
-    // left behind by the first sequence would be read as history by the second.
-    let reused = cache.acquire().unwrap();
-    assert_eq!(reused, slot);
-    let second = model
-        .forward_batch(&Batch::prefill(prompt.clone(), reused, 0), &cache)
-        .unwrap();
+    allocator.free_table(&mut table);
+    assert_eq!(allocator.available(), blocks);
+
+    // The same prompt through the same blocks has to answer the same thing.
+    // Anything left behind would be read as history by the second sequence.
+    let mut reused = BlockTable::new(block_size);
+    grow(&mut allocator, &mut reused, prompt.len());
+    let batch = Batch::new(prompt.clone(), prompt.len(), &[&reused], block_size).unwrap();
+    let second = model.forward_batch(&batch, &cache).unwrap();
 
     let (worst, _) = compare(&second, &first);
     assert!(
         f64::from(worst) <= tolerance,
-        "the reused slot answered differently, off by {worst:.3e}"
+        "the reused blocks answered differently, off by {worst:.3e}"
     );
 }
 
 #[test]
-fn a_batch_that_disagrees_with_the_cache_is_refused() {
+fn a_batch_with_no_block_for_its_next_token_is_refused() {
     let (model, prompt, _) = load_tiny();
-    let mut cache = cache_for(&model, 2, 32);
-    let slot = cache.acquire().unwrap();
-    model
-        .forward_batch(&Batch::prefill(prompt.clone(), slot, 0), &cache)
-        .unwrap();
-    cache.advance(&[slot], prompt.len());
+    let block_size = 4;
+    let (_cache, mut allocator) = pool(&model, block_size, 32);
+    let mut table = BlockTable::new(block_size);
+    grow(&mut allocator, &mut table, prompt.len());
+    table.advance(prompt.len()).unwrap();
 
-    // Claiming the slot is empty when it holds the prompt would put the new
-    // token on top of the first one and rotate it to position zero.
-    assert!(
-        model
-            .forward_batch(&Batch::decode(vec![1], vec![slot], vec![0]), &cache)
-            .is_err()
-    );
-    // Row counts that do not line up are refused before anything is dispatched.
-    assert!(
-        model
-            .forward_batch(
-                &Batch::decode(vec![1, 2], vec![slot], vec![prompt.len()]),
-                &cache
-            )
-            .is_err()
-    );
+    // The table holds exactly the prompt. Placing one more token without giving
+    // it a block has nowhere to go.
+    if table.blocks_needed(1) > 0 {
+        assert!(Batch::new(vec![1], 1, &[&table], block_size).is_err());
+    }
+    // A row count that does not line up is refused before anything runs.
+    assert!(Batch::new(vec![1, 2], 1, &[&table], block_size).is_err());
 }

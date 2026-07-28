@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 3 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a pre-allocated cache. That cache is the layout stage 5 replaces, and the figures below are what it costs, including the one this stage could not explain.
+**Status: stage 4 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks. The reservation that pool replaces is still there as a setting, so the two are compared by a flag rather than by a checkout, and the figures below are that comparison.
 
 ## Design
 
@@ -142,47 +142,87 @@ The shape of that table is the result, not the peak figure. A token costs 14 ms 
 
 What it is enough to say now is that this is the baseline. The cache is one unbroken run of memory per sequence, grown by reallocating, which is the layout stage 5 replaces with a pool of fixed-size blocks. Measuring it before replacing it is the point of building it this way.
 
-## Continuous batching, and what the reservation costs
+## Continuous batching, and what a reservation costs
 
     make bench-concurrency
 
-The scheduler hands out slots from a pool allocated once, `[slots, kv_heads, max_seq, head_dim]` per layer. A sequence holds a slot for its whole life. Admission comes first and takes the whole pass, so a prompt arriving stalls everything already decoding, which is the design vLLM shipped before chunked prefill and the stall stage 8 exists to remove. When the pool is full a sequence waits: with a reservation per sequence the unit that would be evicted is the whole reservation, so preemption would measure the policy rather than the structure.
+The scheduler hands out blocks from a pool allocated once. A sequence holds a
+list of blocks rather than a run of memory, and takes another only when its last
+one fills. Admission comes first and takes the whole pass, so a prompt arriving
+stalls everything already decoding, which is the design vLLM shipped before
+chunked prefill and the stall stage 8 removes. When the pool runs dry the newest
+resident sequence is evicted, its blocks are returned, and it goes back to the
+front of the queue to be recomputed. Waiting instead would deadlock: if every
+resident sequence needs a block and none can finish without one, nothing frees
+anything.
 
-Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 32 slots of 1024 tokens, 128 tokens each:
+The contiguous cache is not gone, it is a setting. `--block-size 1024` on a
+1024-token context gives every sequence exactly one block, which is a
+reservation, and `--block-size 16` is paging. Same pool, same memory, same
+everything else, so the two are one flag apart.
 
-| clients | total tokens/s | per client | ttft ms | p50 s |
-|---------|----------------|------------|---------|-------|
-| 1 | 54.0 | 54.0 | 27 | 2.37 |
-| 2 | 57.6 | 28.8 | 40 | 4.45 |
-| 4 | 75.2 | 18.8 | 66 | 6.81 |
-| 8 | 88.7 | 11.1 | 117 | 11.54 |
-| 16 | 88.9 | 5.6 | 220 | 23.03 |
-| 32 | 92.2 | 2.9 | 427 | 44.40 |
+Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 3584 MiB of cache either way, prompts of
+about ten words and 128 tokens each:
 
-### The reservation
+| clients | reservation tok/s | paging tok/s | reservation ttft | paging ttft | reservation p95 | paging p95 |
+|---------|-------------------|--------------|------------------|-------------|-----------------|------------|
+| 1 | 52.3 | 58.9 | 32 ms | 28 ms | 2.45 s | 2.17 s |
+| 4 | 68.1 | 98.5 | 78 ms | 71 ms | 7.51 s | 5.19 s |
+| 16 | 71.2 | 144.0 | 282 ms | 260 ms | 28.76 s | 14.22 s |
+| 32 | 69.1 | 163.4 | 546 ms | 494 ms | 59.25 s | 25.06 s |
+| 64 | 68.4 | 167.3 | **30 053 ms** | **976 ms** | 119.77 s | 48.97 s |
 
-Qwen3-0.6B costs 114 688 bytes of cache per token, which is 28 layers of keys and values across 8 grouped heads of 128 in bf16. Thirty-two slots of a thousand tokens is therefore 3.50 GiB, allocated before a single request arrives, and the requests above touch 0.47 GiB of it. **87 % of the pool is held and never read.** That number is not a defect of this implementation; it is what reserving a contiguous run per sequence means, and it is the number a paged cache exists to remove.
+Three things in that table, and the last one is the point.
 
-### The number this stage could not explain
+Throughput: paging reaches 2.4 times the reservation's at 64 clients, and keeps
+climbing where the reservation flattens at sixteen and then falls.
 
-Batching should be close to free. A decode step reads every weight of the model once whatever rides along, so eight sequences should cost about what one costs. They do not: throughput rises 1.7 times between one client and thirty-two, and stops climbing at eight.
+Latency: half the p95 at every concurrency past four, for the same reason.
+
+And the row that says why paging exists. At 3584 MiB a reservation of 1024
+tokens buys thirty-two of them, so the thirty-third client waits for someone to
+finish: thirty seconds before its first token, against 976 milliseconds. The same
+memory in blocks of sixteen holds 32 768 tokens, which is 237 sequences of the
+length these requests actually reach. The ceiling moved by a factor of seven, and
+nothing about the model or the kernel changed to move it.
+
+### What paging costs, and what it happens to save
 
     cargo run --release --features metal --example step_cost -- models/Qwen3-0.6B
 
-| rows | step ms | per row ms | the same rows as one prefill |
-|------|---------|------------|------------------------------|
-| 1 | 37.0 | 37.0 | 37.4 |
-| 4 | 125.7 | 31.4 | 46.3 |
-| 8 | 251.6 | 31.5 | 48.0 |
-| 32 | 1164.2 | 36.4 | 67.3 |
+| rows | reservation, ms a row | paging, ms a row |
+|------|-----------------------|------------------|
+| 1 | 29.3 | 27.0 |
+| 8 | 18.0 | 14.6 |
+| 32 | 19.4 | 14.6 |
 
-A step costs about 35 ms per row whatever the batch, and the last column is why that is strange: pushing the same thirty-two rows through the model as one sequence's prompt costs 67 ms rather than 1164. Identical matrix work, seventeen times apart.
+Paging was expected to cost something on the read path, since a sequence's
+history is now scattered and has to be gathered. It does not: it is 24 % cheaper.
+The reason is visible once the shapes are written down. Gathering reads whole
+blocks, and a reservation's block is the whole reservation, so a sequence 257
+tokens long drags 1024 tokens through the copy. Seventeen blocks of sixteen drag
+272. The bookkeeping that paging adds is smaller than the copying it removes.
 
-What was ruled out, each by measurement rather than by reading: the per-slot cache writes are 8 % of the step; gathering the batch's slots row by row is not it, since a fast path that reads a consecutive run in one narrow changed nothing; a plain matrix multiply is flat in its rows, 0.003 ms whether one or a hundred and twenty-eight; so is a batched one, 0.27 ms at sixteen entries against 0.43 at five hundred and twelve. Dropping a transposed copy of the keys took 21 % off. Removing the copy that expands eight key heads into sixteen, by folding the group into the query dimension instead, took nothing off, and is kept because it is one fewer copy rather than because it helped.
+The waste it replaces is also bounded rather than open. A sequence holds at most
+one partly-filled block, sixteen tokens at 112 KiB each, where a reservation
+holds everything the request never reaches.
 
-So this is an open question, not a result, and it is the reason the next measurement is a profile rather than another guess. Micro-benchmarks have been asked six times and have stopped narrowing it. Stage 6 is where Instruments gets to answer it, and this table is what it will be answering.
+### The number this stage still cannot explain
 
-It also sets the terms of the stage 5 comparison honestly in advance. A hand-written attention kernel will read the cache in place with no gather, no expansion and no transposed copy, so it will remove whatever this is along with the reservation. The gain will be large, and the README will have to say how much of it is paging and how much is the copies, rather than letting the number stand for both.
+A decode step should be nearly free per row, since it reads the model's weights
+once whatever rides along. It is not: 14.6 ms a row at thirty-two rows, where
+pushing the same thirty-two rows through as one sequence's prompt costs 68 ms in
+total rather than 468.
+
+Stage 3 measured this at 36 ms a row and could not attribute it. Two fixes since
+have more than halved it, and neither was the answer: writing the batch with one
+scatter per layer instead of one call per row, and folding the grouped-query
+expansion into the query dimension rather than materialising it. The shape of the
+curve is unchanged. It is still flat per row where it should fall.
+
+What has been ruled out by measurement is in the log; what has not been tried is
+a profile. Stage 6 is where Instruments answers it, and it should be pointed here
+before it is pointed at the kernel.
 
 ## Build order
 
@@ -191,7 +231,7 @@ Each stage lands with its tests before the next one starts.
 1. **Model forward pass** (built): safetensors loading, RMSNorm, RoPE, grouped-query attention with the query and key norms Qwen3 adds, SwiGLU, on candle primitives. Checked against the reference implementation at every module boundary.
 2. **Server** (built): `OpenAI`-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time, against a KV cache for one sequence.
 3. **Continuous batching, contiguous cache** (built): the queue, the scheduler and the step loop, against a pool of pre-allocated slots, one reserved buffer per resident sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
-4. **Block allocator** (planned): the paged layout as pure logic, no GPU involved, allocation, release, reference counting and block tables, fully unit tested.
+4. **Block allocator** (built): the paged layout as pure logic, no GPU involved, allocation, release and block tables, fully unit tested, and wired into the serving path so the memory it buys is measured before the kernel arrives.
 5. **Paged attention kernel** (planned): the Metal kernel that reads keys and values through a block table, and its integration into the attention layer.
 6. **Benchmarks and profiling** (planned): against `llama-server` and `mistral.rs` on the same machine with the same model, plus a GPU profile of the kernel. The delta between stages 3 and 5 is the headline result.
 7. **Prefix caching** (planned): a radix tree over block hashes, so requests sharing a system prompt share physical blocks instead of recomputing them.

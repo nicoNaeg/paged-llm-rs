@@ -1,37 +1,35 @@
-//! A KV cache shared by several sequences, and the batch that reads it.
+//! The KV cache as a pool of blocks, and the batch that reads it.
 //!
-//! One tensor per layer, `[slots, kv_heads, max_seq, head_dim]`, allocated once.
-//! A sequence holds a slot for its whole life and writes into it in place. This
-//! is the layout `PagedAttention` replaces, and it is built here first so the
-//! replacement has something measured to beat.
+//! One tensor per layer, `[blocks, block_size, kv_heads, head_dim]`, allocated
+//! once. A sequence holds a list of blocks rather than a run of memory, so its
+//! cache no longer has to be contiguous and the pool no longer has to reserve
+//! the longest it might reach.
 //!
-//! What it costs is visible in the shape of that tensor. Every slot reserves
-//! `max_seq` tokens whatever the sequence turns out to need, so the number of
-//! sequences that fit is decided before any of them arrive. On Qwen3-0.6B a
-//! token of cache is 112 KiB across the 28 layers, which makes a 2048-token
-//! reservation 229 MiB per slot, held whether the request stops after thirty
-//! tokens or runs to the end.
+//! The contiguous cache stage 3 measured is not gone, it is a setting: a block
+//! as wide as the whole reservation gives every sequence exactly one block, and
+//! the pool is back to handing out fixed-size slots. That is literally what a
+//! reservation is, and keeping both behind one implementation is what makes the
+//! comparison a flag rather than a checkout of an old commit.
 //!
-//! It costs a second thing, less obvious and measured rather than assumed.
-//! Sequences in a batch are different lengths, so attention reads a rectangle
-//! that no slot fills. Narrowing the reservation down to the longest sequence in
-//! the batch makes that rectangle smaller but leaves it non-contiguous, which
-//! forces a copy before the multiply. Reading it whole avoids the copy and
-//! computes over the padding instead. There is no third option while a
-//! sequence's cache has to be one unbroken run of memory, and removing that
-//! constraint is what stage 5 is.
+//! What still costs, at either setting, is the read. A batch of sequences at
+//! different lengths is a rectangle no row fills, and gathering it out of the
+//! pool copies it before the multiply. Stage 5 is the kernel that reads the
+//! blocks in place and removes that copy. This stage removes the reservation and
+//! leaves the copy alone on purpose, so the two gains can be told apart.
 
 use candle_core::{DType, Device, Tensor};
 
+use crate::blocks::{BlockId, BlockTable};
 use crate::{Error, Result};
 
-/// How the shared cache is sized.
+/// How the pool is sized.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
-    /// How many sequences can be resident at once.
-    pub slots: usize,
-    /// Tokens reserved for each of them.
-    pub max_seq: usize,
+    /// Tokens per block. As wide as the context this is a reservation per
+    /// sequence, which is what stage 3 measured.
+    pub block_size: usize,
+    /// How many blocks the pool holds.
+    pub blocks: usize,
     /// Key and value heads, from the model.
     pub kv_heads: usize,
     /// Width of one head, from the model.
@@ -49,13 +47,13 @@ impl CacheConfig {
 
     /// Bytes the whole pool costs.
     pub fn bytes(&self, dtype: DType) -> usize {
-        self.slots * self.max_seq * self.bytes_per_token(dtype)
+        self.blocks * self.block_size * self.bytes_per_token(dtype)
     }
 
-    /// The most slots that fit in `budget` bytes, at least one.
-    pub fn slots_within(&self, budget: usize, dtype: DType) -> usize {
-        let per_slot = self.max_seq * self.bytes_per_token(dtype);
-        (budget / per_slot.max(1)).max(1)
+    /// The most blocks that fit in `budget` bytes, at least one.
+    pub fn blocks_within(&self, budget: usize, dtype: DType) -> usize {
+        let per_block = self.block_size * self.bytes_per_token(dtype);
+        (budget / per_block.max(1)).max(1)
     }
 }
 
@@ -63,16 +61,22 @@ impl CacheConfig {
 ///
 /// Every row carries the same number of tokens, which is what makes a batch a
 /// rectangle. Decoding is many rows of one token; a prefill is one row of many.
-/// Mixing the two in a single pass is what stage 8 adds, and its absence is why
-/// a long prompt arriving today stalls every sequence already decoding.
+/// Mixing them in a single pass is what stage 8 adds, and its absence is why a
+/// long prompt arriving today stalls every sequence already decoding.
 #[derive(Debug, Clone)]
 pub struct Batch {
     /// Token ids, row-major, `rows * seq` of them.
     pub tokens: Vec<u32>,
-    /// The cache slot each row reads and writes.
-    pub slots: Vec<usize>,
-    /// Tokens already in each slot before this pass, which is also where the
-    /// row's first token sits.
+    /// Where each of those tokens is written, as a flat position in the pool.
+    /// This is the block table already resolved, one entry per token.
+    pub write_slots: Vec<u32>,
+    /// The blocks every row reads, padded to the widest row so the gather is one
+    /// rectangle.
+    pub read_blocks: Vec<BlockId>,
+    /// How many blocks each row of `read_blocks` holds.
+    pub blocks_per_row: usize,
+    /// Tokens already written for each row, which is where its first token of
+    /// this pass sits.
     pub starts: Vec<usize>,
     /// How many rows.
     pub rows: usize,
@@ -81,57 +85,69 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// One sequence's prompt, filling a slot from `start`.
-    pub fn prefill(tokens: Vec<u32>, slot: usize, start: usize) -> Self {
-        let seq = tokens.len();
-        Self {
-            tokens,
-            slots: vec![slot],
-            starts: vec![start],
-            rows: 1,
-            seq,
+    /// Build from the tables of the rows taking part.
+    ///
+    /// The tables must already hold blocks for the tokens being written. Making
+    /// sure of that is the scheduler's job, because it is what preempts when the
+    /// blocks cannot be found.
+    ///
+    /// # Panics
+    ///
+    /// If a block index does not fit in a `u32`, which no pool this size can
+    /// reach.
+    pub fn new(
+        tokens: Vec<u32>,
+        seq: usize,
+        tables: &[&BlockTable],
+        block_size: usize,
+    ) -> Result<Self> {
+        let rows = tables.len();
+        if rows == 0 || seq == 0 || tokens.len() != rows * seq {
+            return Err(Error::Config(format!(
+                "{} tokens for {rows} rows of {seq}",
+                tokens.len()
+            )));
         }
-    }
+        let starts: Vec<usize> = tables.iter().map(|t| t.tokens()).collect();
+        let longest = starts.iter().map(|s| s + seq).max().unwrap_or(0);
+        let blocks_per_row = longest.div_ceil(block_size);
 
-    /// One token for each of several sequences.
-    pub fn decode(tokens: Vec<u32>, slots: Vec<usize>, starts: Vec<usize>) -> Self {
-        let rows = tokens.len();
-        Self {
+        let mut write_slots = Vec::with_capacity(rows * seq);
+        let mut read_blocks = Vec::with_capacity(rows * blocks_per_row);
+        for (row, table) in tables.iter().enumerate() {
+            for offset in 0..seq {
+                let position = starts[row] + offset;
+                let slot = table.slot_of(position).ok_or_else(|| {
+                    Error::Config(format!("row {row} has no block for position {position}"))
+                })?;
+                write_slots.push(u32::try_from(slot).expect("a pool fits in u32"));
+            }
+            // Padded with the row's own first block rather than an arbitrary
+            // one. This changes no answer, and that was checked: the mask hides
+            // the padding whatever sits behind it. It is here so that a future
+            // mask defect reads this sequence's own history rather than a
+            // stranger's, which is a wrong answer instead of a leak.
+            let blocks = table.blocks();
+            let filler = *blocks.first().unwrap_or(&0);
+            for index in 0..blocks_per_row {
+                read_blocks.push(blocks.get(index).copied().unwrap_or(filler));
+            }
+        }
+
+        Ok(Self {
             tokens,
-            slots,
+            write_slots,
+            read_blocks,
+            blocks_per_row,
             starts,
             rows,
-            seq: 1,
-        }
+            seq,
+        })
     }
 
     /// The furthest any row reaches once this pass is written.
     pub fn longest(&self) -> usize {
         self.starts.iter().map(|s| s + self.seq).max().unwrap_or(0)
-    }
-
-    /// Check the row counts agree before anything is dispatched.
-    pub fn validate(&self) -> Result<()> {
-        if self.rows == 0 || self.seq == 0 {
-            return Err(Error::Config("an empty batch".into()));
-        }
-        if self.tokens.len() != self.rows * self.seq {
-            return Err(Error::Config(format!(
-                "{} tokens for {} rows of {}",
-                self.tokens.len(),
-                self.rows,
-                self.seq
-            )));
-        }
-        if self.slots.len() != self.rows || self.starts.len() != self.rows {
-            return Err(Error::Config(format!(
-                "{} rows against {} slots and {} offsets",
-                self.rows,
-                self.slots.len(),
-                self.starts.len()
-            )));
-        }
-        Ok(())
     }
 
     /// Absolute position of every token, `[rows, seq]`.
@@ -147,11 +163,10 @@ impl Batch {
 
     /// Additive mask, `[rows, 1, seq, longest]`.
     ///
-    /// Two things at once, which is why it is not the single-sequence mask with
-    /// a batch dimension bolted on. It forbids a query from reading a key ahead
-    /// of it, as always; and it forbids every row from reading the part of the
-    /// rectangle that belongs to a longer sequence than its own, which is the
-    /// padding a batch of unequal lengths cannot avoid.
+    /// Two things at once. It forbids a query from reading a key ahead of it, as
+    /// always; and it forbids every row from reading the part of the rectangle
+    /// that belongs to a longer sequence than its own, which is the padding a
+    /// batch of unequal lengths cannot avoid.
     pub(crate) fn mask(&self, dtype: DType, device: &Device) -> Result<Tensor> {
         let longest = self.longest();
         let mut mask = Vec::with_capacity(self.rows * self.seq * longest);
@@ -174,41 +189,43 @@ impl Batch {
     }
 }
 
-/// The keys and values of every resident sequence.
+/// The keys and values of every resident sequence, as a pool of blocks.
 #[derive(Debug)]
-pub struct SlotCache {
-    /// Per layer, `[slots, kv_heads, max_seq, head_dim]`.
+pub struct PagedCache {
+    /// Per layer, `[blocks * block_size, kv_heads * head_dim]`, the shape a
+    /// scatter writes.
     keys: Vec<Tensor>,
     values: Vec<Tensor>,
+    /// The same storage as `[blocks, block_size * kv_heads * head_dim]`, the
+    /// shape a gather of whole blocks reads.
+    key_blocks: Vec<Tensor>,
+    value_blocks: Vec<Tensor>,
     config: CacheConfig,
-    /// Tokens written into each slot.
-    lengths: Vec<usize>,
-    free: Vec<usize>,
 }
 
-impl SlotCache {
+impl PagedCache {
     /// Allocate the pool. This is the whole allocation: nothing here grows.
     pub fn new(config: CacheConfig, dtype: DType, device: &Device) -> Result<Self> {
-        let shape = (
-            config.slots,
-            config.kv_heads,
-            config.max_seq,
-            config.head_dim,
-        );
+        let slots = config.blocks * config.block_size;
+        let width = config.kv_heads * config.head_dim;
         let mut keys = Vec::with_capacity(config.layers);
         let mut values = Vec::with_capacity(config.layers);
+        let mut key_blocks = Vec::with_capacity(config.layers);
+        let mut value_blocks = Vec::with_capacity(config.layers);
         for _ in 0..config.layers {
-            keys.push(Tensor::zeros(shape, dtype, device)?);
-            values.push(Tensor::zeros(shape, dtype, device)?);
+            let k = Tensor::zeros((slots, width), dtype, device)?;
+            let v = Tensor::zeros((slots, width), dtype, device)?;
+            key_blocks.push(k.reshape((config.blocks, config.block_size * width))?);
+            value_blocks.push(v.reshape((config.blocks, config.block_size * width))?);
+            keys.push(k);
+            values.push(v);
         }
         Ok(Self {
             keys,
             values,
+            key_blocks,
+            value_blocks,
             config,
-            lengths: vec![0; config.slots],
-            // Handed out from the end so the first sequence takes slot 0, which
-            // makes a trace easier to read and changes nothing else.
-            free: (0..config.slots).rev().collect(),
         })
     }
 
@@ -217,154 +234,113 @@ impl SlotCache {
         &self.config
     }
 
-    /// Take a slot, or `None` when every one is held.
-    pub fn acquire(&mut self) -> Option<usize> {
-        let slot = self.free.pop()?;
-        self.lengths[slot] = 0;
-        Some(slot)
-    }
-
-    /// Give a slot back. Its contents are not cleared: nothing reads past a
-    /// slot's length, and the next sequence to hold it starts at zero.
-    pub fn release(&mut self, slot: usize) {
-        if slot < self.config.slots && !self.free.contains(&slot) {
-            self.lengths[slot] = 0;
-            self.free.push(slot);
-        }
-    }
-
-    /// How many slots are free.
-    pub fn free_slots(&self) -> usize {
-        self.free.len()
-    }
-
-    /// Tokens written into `slot`.
-    pub fn length(&self, slot: usize) -> usize {
-        self.lengths.get(slot).copied().unwrap_or(0)
-    }
-
-    /// Whether `slot` can take `count` more tokens.
-    pub fn has_room(&self, slot: usize, count: usize) -> bool {
-        self.length(slot) + count <= self.config.max_seq
-    }
-
-    /// Write one batch's keys and values into their slots, in place.
+    /// Write a batch's keys and values into the blocks its rows hold.
     ///
-    /// `k` and `v` are `[rows, kv_heads, seq, head_dim]` and `slots` names the
-    /// slot each row belongs to. Nothing is reallocated: this is the property
-    /// the pre-allocated pool exists for, and the one the stage 2 cache did not
-    /// have.
-    pub(crate) fn write(
-        &self,
-        layer: usize,
-        k: &Tensor,
-        v: &Tensor,
-        slots: &[usize],
-        starts: &[usize],
-    ) -> Result<()> {
-        let (rows, _, seq, _) = k.dims4()?;
-        if rows != slots.len() || rows != starts.len() {
-            return Err(Error::Config(format!(
-                "{rows} rows against {} slots and {} offsets",
-                slots.len(),
-                starts.len()
-            )));
-        }
-        let (keys, values) = (&self.keys[layer], &self.values[layer]);
-        for (row, (&slot, &start)) in slots.iter().zip(starts).enumerate() {
-            if start + seq > self.config.max_seq {
-                return Err(Error::Config(format!(
-                    "slot {slot} would reach {} of {} reserved tokens",
-                    start + seq,
-                    self.config.max_seq
-                )));
-            }
-            keys.narrow(0, slot, 1)?
-                .slice_set(&k.narrow(0, row, 1)?.contiguous()?, 2, start)?;
-            values
-                .narrow(0, slot, 1)?
-                .slice_set(&v.narrow(0, row, 1)?.contiguous()?, 2, start)?;
-        }
+    /// One scatter per layer whatever the batch, where the slot cache needed one
+    /// call per row. The block table has already been resolved into flat
+    /// positions, so the scatter does not care that a sequence's tokens are
+    /// scattered.
+    pub(crate) fn write(&self, layer: usize, k: &Tensor, v: &Tensor, slots: &Tensor) -> Result<()> {
+        let width = self.config.kv_heads * self.config.head_dim;
+        // Transposed first, because the attention hands these over head-major,
+        // `[rows, kv_heads, seq, head_dim]`, and a token's whole key vector has
+        // to be one run before it can be scattered to one place. Reshaping
+        // without the transpose splits every token across head boundaries, and
+        // reads it back the same way, so nothing disagrees until the result is
+        // compared against a path that never went through the pool.
+        let flat = |t: &Tensor| -> Result<Tensor> {
+            Ok(t.transpose(1, 2)?.contiguous()?.reshape(((), width))?)
+        };
+        self.keys[layer].scatter_set(slots, &flat(k)?, 0)?;
+        self.values[layer].scatter_set(slots, &flat(v)?, 0)?;
         Ok(())
     }
 
-    /// Write one token into every slot, and nothing else.
-    ///
-    /// Exists to be timed: it is the part of a decode step whose dispatch count
-    /// grows with the batch, where everything else grows with its arithmetic.
-    /// Nothing in the serving path calls it.
-    pub fn write_probe(&self, slots: &[usize], starts: &[usize]) -> Result<()> {
-        let shape = (slots.len(), self.config.kv_heads, 1, self.config.head_dim);
-        let dtype = self.keys[0].dtype();
-        let k = Tensor::zeros(shape, dtype, self.keys[0].device())?;
-        for layer in 0..self.config.layers {
-            self.write(layer, &k, &k, slots, starts)?;
-        }
-        Ok(())
-    }
-
-    /// Record that every slot in `slots` grew by `count` tokens.
-    ///
-    /// Called by whoever ran the pass, not by the pass itself. A forward pass
-    /// that failed part way through must not leave the bookkeeping claiming it
-    /// succeeded, and only the caller knows which happened.
-    pub fn advance(&mut self, slots: &[usize], count: usize) {
-        for &slot in slots {
-            self.lengths[slot] += count;
-        }
-    }
-
-    /// The keys and values the attention should read for `slots`, narrowed to
-    /// the longest of them.
-    ///
-    /// Returns `[rows, kv_heads, longest, head_dim]`. The narrowing is what
-    /// keeps the multiply off the unused end of every reservation, and the copy
-    /// it forces is the cost named in this module's header.
+    /// Gather what the attention reads, `[rows, kv_heads, longest, head_dim]`.
     pub(crate) fn read(
         &self,
         layer: usize,
-        slots: &[usize],
-        longest: usize,
+        batch: &Batch,
+        blocks: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // A run of consecutive slots is one narrow, so the whole rectangle
-        // reaches the multiply in a single copy. Anything else has to be
-        // gathered row by row, and that gather is one dispatch per row per
-        // layer, twice, which is what makes a decode step cost the same again
-        // for every sequence added to it.
-        let consecutive = slots.windows(2).all(|pair| pair[1] == pair[0] + 1);
+        let longest = batch.longest();
+        let tokens = batch.blocks_per_row * self.config.block_size;
         let gather = |pool: &Tensor| -> Result<Tensor> {
-            if consecutive {
-                return Ok(pool
-                    .narrow(0, slots[0], slots.len())?
-                    .narrow(2, 0, longest)?
-                    .contiguous()?);
-            }
-            let rows: Result<Vec<Tensor>> = slots
-                .iter()
-                .map(|&slot| Ok(pool.narrow(0, slot, 1)?.narrow(2, 0, longest)?))
-                .collect();
-            Ok(Tensor::cat(&rows?, 0)?.contiguous()?)
+            Ok(pool
+                .index_select(blocks, 0)?
+                .reshape((
+                    batch.rows,
+                    tokens,
+                    self.config.kv_heads,
+                    self.config.head_dim,
+                ))?
+                // Narrowed before the transpose so the copy the transpose forces
+                // carries what the batch reaches, not the whole of every block
+                // it borrowed those tokens from.
+                .narrow(1, 0, longest)?
+                .transpose(1, 2)?
+                .contiguous()?)
         };
-        Ok((gather(&self.keys[layer])?, gather(&self.values[layer])?))
+        Ok((
+            gather(&self.key_blocks[layer])?,
+            gather(&self.value_blocks[layer])?,
+        ))
+    }
+
+    /// The scatter index a write needs, `[tokens, kv_heads * head_dim]`.
+    ///
+    /// Every column of a row carries the same position, because a token's whole
+    /// key vector goes to one place.
+    pub(crate) fn write_index(&self, batch: &Batch, device: &Device) -> Result<Tensor> {
+        let width = self.config.kv_heads * self.config.head_dim;
+        let mut index = Vec::with_capacity(batch.write_slots.len() * width);
+        for &slot in &batch.write_slots {
+            index.extend(std::iter::repeat_n(slot, width));
+        }
+        Ok(Tensor::from_vec(
+            index,
+            (batch.write_slots.len(), width),
+            device,
+        )?)
+    }
+
+    /// The gather index a read needs, one entry per block of the rectangle.
+    #[allow(clippy::unused_self)]
+    pub(crate) fn read_index(&self, batch: &Batch, device: &Device) -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            batch.read_blocks.clone(),
+            batch.read_blocks.len(),
+            device,
+        )?)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, SlotCache};
+    use super::{Batch, CacheConfig, PagedCache};
+    use crate::blocks::{BlockAllocator, BlockTable};
     use candle_core::{DType, Device, Tensor};
 
-    fn config() -> CacheConfig {
+    fn config(block_size: usize, blocks: usize) -> CacheConfig {
         CacheConfig {
-            slots: 3,
-            max_seq: 8,
+            block_size,
+            blocks,
             kv_heads: 2,
             head_dim: 4,
             layers: 2,
         }
     }
 
-    fn step(value: f32, tokens: usize) -> Tensor {
+    /// A sequence's worth of blocks, taken from `pool`.
+    fn table(pool: &mut BlockAllocator, block_size: usize, tokens: usize) -> BlockTable {
+        let mut table = BlockTable::new(block_size);
+        for _ in 0..table.blocks_needed(tokens) {
+            table.push(pool.allocate().unwrap());
+        }
+        table
+    }
+
+    fn payload(value: f32, tokens: usize) -> Tensor {
         Tensor::full(value, (1, 2, tokens, 4), &Device::Cpu).unwrap()
     }
 
@@ -372,126 +348,104 @@ mod tests {
     fn a_token_of_cache_costs_what_the_arithmetic_says() {
         // Qwen3-0.6B: 28 layers, 8 key heads, 128 wide, in bf16.
         let qwen = CacheConfig {
-            slots: 1,
-            max_seq: 2048,
+            block_size: 16,
+            blocks: 1,
             kv_heads: 8,
             head_dim: 128,
             layers: 28,
         };
         assert_eq!(qwen.bytes_per_token(DType::BF16), 114_688);
-        assert_eq!(qwen.bytes(DType::BF16), 2048 * 114_688);
-        // Eight gigabytes buys this many sequences, whatever they turn out to
-        // need, which is the number stage 5 has to raise.
-        assert_eq!(qwen.slots_within(8 << 30, DType::BF16), 36);
+        assert_eq!(qwen.bytes(DType::BF16), 16 * 114_688);
+        // The same 3.5 GiB stage 3 spent on 32 reservations buys this many
+        // blocks, which is what raises the number of sequences that fit.
+        assert_eq!(qwen.blocks_within(3_758_096_384, DType::BF16), 2048);
     }
 
     #[test]
-    fn slots_are_handed_out_and_taken_back() {
-        let mut cache = SlotCache::new(config(), DType::F32, &Device::Cpu).unwrap();
-        let held: Vec<usize> = (0..3).map(|_| cache.acquire().unwrap()).collect();
-        assert_eq!(held, vec![0, 1, 2]);
-        assert_eq!(cache.acquire(), None, "a fourth sequence has nowhere to go");
-        cache.release(1);
-        assert_eq!(cache.acquire(), Some(1));
+    fn what_a_sequence_wrote_is_what_comes_back_out_of_its_blocks() {
+        let device = Device::Cpu;
+        let config = config(2, 8);
+        let cache = PagedCache::new(config, DType::F32, &device).unwrap();
+        let mut pool = BlockAllocator::new(config.blocks);
+
+        // Two sequences whose blocks interleave, so neither holds a run.
+        let mut first = table(&mut pool, 2, 5);
+        let mut second = table(&mut pool, 2, 3);
+        assert_ne!(first.blocks(), second.blocks());
+
+        let write = |table: &BlockTable, value: f32, seq: usize| {
+            let batch = Batch::new(vec![0; seq], seq, &[table], 2).unwrap();
+            let index = cache.write_index(&batch, &device).unwrap();
+            let k = payload(value, seq);
+            cache.write(0, &k, &k.neg().unwrap(), &index).unwrap();
+        };
+        write(&first, 1.0, 5);
+        first.advance(5).unwrap();
+        write(&second, 7.0, 3);
+        second.advance(3).unwrap();
+
+        let batch = Batch::new(vec![0, 0], 1, &[&first, &second], 2).unwrap();
+        let blocks = cache.read_index(&batch, &device).unwrap();
+        let (keys, values) = cache.read(0, &batch, &blocks).unwrap();
+        assert_eq!(keys.dims(), &[2, 2, 6, 4]);
+
+        let head = |t: &Tensor, row: usize| -> Vec<f32> {
+            t.narrow(0, row, 1)
+                .unwrap()
+                .narrow(1, 0, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        // Five tokens of 1.0 for the first sequence, whatever it wrote, out of
+        // blocks that are not next to each other.
+        assert_eq!(&head(&keys, 0)[..20], &[1.0; 20]);
+        // Three tokens for the second, and its values are the negatives, so a
+        // read that crossed the two would be visible in the sign.
+        assert_eq!(&head(&values, 1)[..12], &[-7.0; 12]);
     }
 
     #[test]
-    fn releasing_a_slot_twice_does_not_hand_it_out_twice() {
-        let mut cache = SlotCache::new(config(), DType::F32, &Device::Cpu).unwrap();
-        let slot = cache.acquire().unwrap();
-        cache.release(slot);
-        cache.release(slot);
-        assert_eq!(cache.free_slots(), 3);
+    fn a_block_as_wide_as_the_context_is_one_block_a_sequence() {
+        let mut pool = BlockAllocator::new(4);
+        let table = table(&mut pool, 1024, 300);
+        assert_eq!(table.blocks().len(), 1, "a reservation is one block");
+        assert_eq!(table.capacity(), 1024);
+        // Which is what stage 3 reserved, and what it wasted.
+        assert_eq!(table.wasted_tokens(), 1024);
     }
 
     #[test]
-    fn what_a_slot_holds_is_what_was_written_to_it() {
-        let mut cache = SlotCache::new(config(), DType::F32, &Device::Cpu).unwrap();
-        let (a, b) = (cache.acquire().unwrap(), cache.acquire().unwrap());
+    fn a_batch_rectangle_is_padded_with_the_rows_own_first_block() {
+        let mut pool = BlockAllocator::new(8);
+        // Seven tokens of room for six written, so the row has somewhere to put
+        // the token this batch is about to produce.
+        let mut long = table(&mut pool, 2, 7);
+        long.advance(6).unwrap();
+        let mut short = table(&mut pool, 2, 3);
+        short.advance(2).unwrap();
 
-        cache
-            .write(0, &step(1.0, 3), &step(-1.0, 3), &[a], &[0])
-            .unwrap();
-        cache.advance(&[a], 3);
-        cache
-            .write(0, &step(2.0, 2), &step(-2.0, 2), &[b], &[0])
-            .unwrap();
-        cache.advance(&[b], 2);
-        // One more token on the first sequence, written past what it already
-        // holds rather than over it.
-        cache
-            .write(0, &step(3.0, 1), &step(-3.0, 1), &[a], &[3])
-            .unwrap();
-        cache.advance(&[a], 1);
-
-        assert_eq!(cache.length(a), 4);
-        assert_eq!(cache.length(b), 2);
-
-        let (keys, values) = cache.read(0, &[a, b], 4).unwrap();
-        assert_eq!(keys.dims(), &[2, 2, 4, 4]);
-        let first: Vec<f32> = keys
-            .narrow(0, 0, 1)
-            .unwrap()
-            .narrow(1, 0, 1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(&first[..4], &[1.0, 1.0, 1.0, 1.0], "first token of slot a");
+        let batch = Batch::new(vec![0, 0], 1, &[&long, &short], 2).unwrap();
         assert_eq!(
-            &first[12..],
-            &[3.0, 3.0, 3.0, 3.0],
-            "fourth token of slot a"
+            batch.blocks_per_row, 4,
+            "seven tokens need four blocks of two"
         );
-
-        // The second slot is untouched past its own two tokens, and the first
-        // slot's writes did not reach it.
-        let second: Vec<f32> = values
-            .narrow(0, 1, 1)
-            .unwrap()
-            .narrow(1, 0, 1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        assert_eq!(&second[..8], &[-2.0; 8]);
-        assert_eq!(
-            &second[8..],
-            &[0.0; 8],
-            "past the length, nothing was written"
-        );
+        assert_eq!(batch.read_blocks.len(), 8);
+        let short_row = &batch.read_blocks[4..];
+        assert_eq!(short_row[2], short_row[0]);
+        assert_eq!(short_row[3], short_row[0]);
     }
 
     #[test]
-    fn a_write_past_the_reservation_is_refused_rather_than_wrapping() {
-        let mut cache = SlotCache::new(config(), DType::F32, &Device::Cpu).unwrap();
-        let slot = cache.acquire().unwrap();
-        assert!(cache.has_room(slot, 8));
-        assert!(
-            cache
-                .write(0, &step(1.0, 8), &step(1.0, 8), &[slot], &[0])
-                .is_ok()
-        );
-        cache.advance(&[slot], 8);
-        assert!(!cache.has_room(slot, 1), "the reservation is full");
-        assert!(
-            cache
-                .write(0, &step(1.0, 1), &step(1.0, 1), &[slot], &[8])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn layers_do_not_see_each_others_writes() {
-        let mut cache = SlotCache::new(config(), DType::F32, &Device::Cpu).unwrap();
-        let slot = cache.acquire().unwrap();
-        cache
-            .write(0, &step(5.0, 1), &step(5.0, 1), &[slot], &[0])
-            .unwrap();
-        let (keys, _) = cache.read(1, &[slot], 1).unwrap();
-        let values: Vec<f32> = keys.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(values, vec![0.0; values.len()]);
+    fn a_batch_whose_tables_are_too_small_is_refused() {
+        let mut pool = BlockAllocator::new(4);
+        let mut table = BlockTable::new(2);
+        table.push(pool.allocate().unwrap());
+        table.advance(2).unwrap();
+        // The block is full and nothing was added, so the next token has
+        // nowhere to go.
+        assert!(Batch::new(vec![0], 1, &[&table], 2).is_err());
     }
 }

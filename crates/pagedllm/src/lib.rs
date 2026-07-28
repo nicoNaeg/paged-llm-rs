@@ -12,6 +12,7 @@
 
 pub mod backend;
 pub mod batch;
+pub mod blocks;
 pub mod chat;
 pub mod config;
 pub mod error;
@@ -27,7 +28,8 @@ pub mod weights;
 pub use candle_core::{DType, Device};
 
 pub use backend::Backend;
-pub use batch::{Batch, CacheConfig, SlotCache};
+pub use batch::{Batch, CacheConfig, PagedCache};
+pub use blocks::{BlockAllocator, BlockId, BlockTable};
 pub use chat::ChatTemplate;
 pub use config::{Config, GenerationConfig};
 pub use error::{Error, Result};

@@ -6,7 +6,7 @@ use super::Trace;
 use super::layers::{Linear, RmsNorm};
 use super::rope::Rope;
 use crate::Result;
-use crate::batch::{Batch, SlotCache};
+use crate::batch::{Batch, PagedCache};
 
 /// One attention block.
 #[derive(Debug)]
@@ -125,9 +125,8 @@ impl Attention {
         rope: &Rope,
         layer: usize,
         batch: &Batch,
-        cache: &SlotCache,
-        positions: &Tensor,
-        mask: &Tensor,
+        cache: &PagedCache,
+        index: &PassIndex,
     ) -> Result<Tensor> {
         let (rows, seq, _) = x.dims3()?;
 
@@ -148,30 +147,56 @@ impl Attention {
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let q = rope.apply_at(&q, positions)?;
-        let k = rope.apply_at(&k, positions)?;
+        let q = rope.apply_at(&q, &index.positions)?;
+        let k = rope.apply_at(&k, &index.positions)?;
 
         // Written before the read, so a row attends to the token it is
         // producing as well as to its history. Writing after would leave every
         // query one position short of itself.
-        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;
-        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;
+        cache.write(layer, &k, &v, &index.write_slots)?;
+        let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;
 
+        // Grouped-query attention without materialising the group. Expanding
+        // eight key heads into sixteen is a copy, per layer and per pass, on
+        // data that grows with the batch. Folding the group into the query
+        // dimension asks the same arithmetic of one batched multiply and copies
+        // nothing: query head `kv * group + g` already sits where a reshape puts
+        // it.
         let group = self.num_heads / self.num_kv_heads;
-        let keys = repeat_kv(&keys, group)?;
-        let values = repeat_kv(&values, group)?;
+        let kv_heads = self.num_kv_heads;
+        let longest = keys.dim(D::Minus2)?;
+        let q = q.reshape((rows, kv_heads, group * seq, self.head_dim))?;
 
         let scores = (q.matmul(&keys.transpose(D::Minus2, D::Minus1)?)? * self.scale)?;
-        let scores = scores.broadcast_add(mask)?;
+        let scores = scores
+            .reshape((rows, kv_heads, group, seq, longest))?
+            .broadcast_add(&index.mask.unsqueeze(1)?)?
+            .reshape((rows, kv_heads, group * seq, longest))?;
         let weights = softmax_last_dim(&scores)?;
 
-        let out = weights.matmul(&values)?.transpose(1, 2)?.reshape((
-            rows,
-            seq,
-            self.num_heads * self.head_dim,
-        ))?;
+        let out = weights
+            .matmul(&values)?
+            .reshape((rows, self.num_heads, seq, self.head_dim))?
+            .transpose(1, 2)?
+            .reshape((rows, seq, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
+}
+
+/// Everything a pass needs that does not change from layer to layer.
+///
+/// Built once and handed down, because each of these costs a transfer to the
+/// device and there are twenty-eight layers to pay it in.
+#[derive(Debug)]
+pub struct PassIndex {
+    /// Where each token's key and value is written, `[tokens, kv_heads * head_dim]`.
+    pub write_slots: Tensor,
+    /// The blocks the batch reads, one entry per block of the rectangle.
+    pub read_blocks: Tensor,
+    /// Absolute position of every token, `[rows, seq]`.
+    pub positions: Tensor,
+    /// What each row may read, `[rows, 1, seq, longest]`.
+    pub mask: Tensor,
 }
 
 /// Expand each key or value head to cover the query heads that share it.

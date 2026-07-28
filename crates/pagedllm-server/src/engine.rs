@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pagedllm::{
-    Batch, CacheConfig, DType, Device, Finish, IncrementalDecoder, Model, Plan, Request, Scheduler,
-    Sequence, SlotCache, Tokenizer,
+    Batch, CacheConfig, DType, Device, Finish, IncrementalDecoder, Model, PagedCache, Plan,
+    Request, Scheduler, Sequence, Tokenizer,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -47,11 +47,12 @@ struct Job {
 /// How the pool is sized at startup.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
-    /// Tokens reserved per sequence, prompt and completion together.
-    pub max_seq: usize,
-    /// Sequences that can be resident at once.
-    pub slots: usize,
-    /// Rows in one decode pass, capped independently of the slots.
+    /// Tokens per block. As wide as the context this is one reservation per
+    /// sequence, which is the layout stage 3 measured.
+    pub block_size: usize,
+    /// How many blocks the pool holds.
+    pub blocks: usize,
+    /// Rows in one decode pass, capped independently of the blocks.
     pub max_batch: usize,
 }
 
@@ -89,14 +90,14 @@ impl Engine {
                     let model = Model::load_as(&dir, &device, dtype).map_err(|e| e.to_string())?;
                     let config = model.config();
                     let cache_config = CacheConfig {
-                        slots: pool.slots,
-                        max_seq: pool.max_seq,
+                        block_size: pool.block_size,
+                        blocks: pool.blocks,
                         kv_heads: config.num_key_value_heads,
                         head_dim: config.head_dim,
                         layers: config.num_hidden_layers,
                     };
                     let bytes = cache_config.bytes(model.dtype());
-                    let cache = SlotCache::new(cache_config, model.dtype(), &device)
+                    let cache = PagedCache::new(cache_config, model.dtype(), &device)
                         .map_err(|e| e.to_string())?;
                     Ok::<_, String>((model, cache, bytes))
                 })();
@@ -111,7 +112,8 @@ impl Engine {
                 let _ = ready.send(Ok(bytes));
                 run(
                     &model,
-                    Scheduler::new(cache, pool.max_batch),
+                    &cache,
+                    Scheduler::new(pool.blocks, pool.block_size, pool.max_batch),
                     &thread_tokenizer,
                     inbox,
                 );
@@ -170,6 +172,7 @@ struct Client {
 
 fn run(
     model: &Model,
+    cache: &PagedCache,
     mut scheduler: Scheduler,
     tokenizer: &Tokenizer,
     mut inbox: mpsc::UnboundedReceiver<Job>,
@@ -197,10 +200,7 @@ fn run(
 
         let ids = plan.ids().to_vec();
         let sampled = match plan.batch() {
-            // A prompt the scheduler refused before it ran, which it reports by
-            // planning an empty batch.
-            Some(batch) if batch.tokens.is_empty() => Vec::new(),
-            Some(batch) => match sample(model, &mut scheduler, batch, &ids) {
+            Some(batch) => match sample(model, cache, &mut scheduler, batch, &ids) {
                 Ok(tokens) => tokens,
                 Err(e) => {
                     fail(&mut scheduler, &mut clients, &ids, &e);
@@ -245,12 +245,13 @@ fn run(
 /// Run one batch and choose a token for each of its rows.
 fn sample(
     model: &Model,
+    cache: &PagedCache,
     scheduler: &mut Scheduler,
     batch: &Batch,
     ids: &[u64],
 ) -> Result<Vec<u32>, String> {
     let logits = model
-        .forward_batch(batch, scheduler.cache_mut())
+        .forward_batch(batch, cache)
         .map_err(|e| e.to_string())?;
     // One transfer for the whole batch rather than one per row. The vocabulary
     // is 150k logits wide and all of it has to reach the host for a sampler that

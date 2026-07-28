@@ -31,11 +31,13 @@ BINARY = ROOT / "target/release/pagedllm-server"
 PORT = 8188
 BASE = f"http://127.0.0.1:{PORT}"
 
-MAX_MODEL_LEN = 1024
-SLOTS = 32
+CACHE_MIB = 3584
 PROMPT = "Write a short paragraph about the sea, in plain language."
 TOKENS = 128
-CONCURRENCY = (1, 2, 4, 8, 16, 32)
+CONCURRENCY = (1, 4, 16, 32, 64)
+# A block as wide as the context is one block a sequence, which is a
+# reservation; sixteen is paging. Same memory, same everything else.
+LAYOUTS = ((1024, "one block a sequence, a reservation"), (16, "blocks of sixteen, paging"))
 
 
 def one_request(index: int) -> tuple[float, float, int]:
@@ -86,14 +88,20 @@ def main() -> int:
     if not MODEL.exists():
         raise SystemExit(f"{MODEL} is missing; run `make model` first")
 
+    for block_size, label in LAYOUTS:
+        run_layout(block_size, label)
+    return 0
+
+
+def run_layout(block_size: int, label: str) -> None:
     process = subprocess.Popen(
         [
             str(BINARY),
             "--model", str(MODEL),
             "--port", str(PORT),
-            "--max-model-len", str(MAX_MODEL_LEN),
-            "--max-sequences", str(SLOTS),
-            "--max-batch", str(SLOTS),
+            "--block-size", str(block_size),
+            "--cache-mib", str(CACHE_MIB),
+            "--max-batch", "64",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -103,7 +111,7 @@ def main() -> int:
         # Warm the first dispatch so it does not land inside the first row.
         one_request(0)
 
-        print(f"\nprompt of about {len(PROMPT.split())} words, {TOKENS} tokens each")
+        print(f"\n{label}, {CACHE_MIB} MiB of cache")
         print(
             f"  {'clients':>8} {'total tok/s':>12} {'per client':>11}"
             f" {'ttft ms':>9} {'p50 s':>7} {'p95 s':>7}"
@@ -130,22 +138,17 @@ def main() -> int:
         best = max(rows, key=lambda r: r[1])
         alone = rows[0][1]
         print(
-            f"\n  {best[1] / alone:.1f}x the throughput of one client at a time,"
+            f"  {best[1] / alone:.1f}x the throughput of one client at a time,"
             f" reached at {best[0]} clients"
         )
 
-        # What the reservation cost to buy that.
         bytes_per_token = 114_688
-        reserved = SLOTS * MAX_MODEL_LEN * bytes_per_token
-        used = SLOTS * (len(PROMPT.split()) + TOKENS) * bytes_per_token
+        held = (CACHE_MIB << 20) // bytes_per_token
+        used = max(CONCURRENCY) * (len(PROMPT.split()) + TOKENS)
         print(
-            f"  {reserved / (1 << 30):.2f} GiB reserved for {SLOTS} slots of"
-            f" {MAX_MODEL_LEN} tokens, of which these requests touch"
-            f" {used / (1 << 30):.2f} GiB"
-        )
-        print(
-            f"  {100 * (1 - used / reserved):.0f}% of the pool is held and never"
-            " read, which is the number a paged cache exists to remove"
+            f"  the pool holds {held} tokens; {max(CONCURRENCY)} sequences of about"
+            f" {len(PROMPT.split()) + TOKENS} tokens need {used},"
+            f" so it fits {held // (len(PROMPT.split()) + TOKENS)} of them"
         )
     finally:
         process.terminate()

@@ -14,12 +14,12 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::batch::{Batch, SlotCache};
+use crate::batch::{Batch, PagedCache};
 use crate::config::Config;
 use crate::weights::Weights;
 use crate::{Error, Result};
 
-use attention::Attention;
+use attention::{Attention, PassIndex};
 use layers::{Linear, Mlp, RmsNorm};
 use rope::Rope;
 
@@ -119,14 +119,13 @@ impl Block {
         rope: &Rope,
         layer: usize,
         batch: &Batch,
-        cache: &SlotCache,
-        positions: &Tensor,
-        mask: &Tensor,
+        cache: &PagedCache,
+        index: &PassIndex,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn = self
             .self_attn
-            .forward_batch(&normed, rope, layer, batch, cache, positions, mask)?;
+            .forward_batch(&normed, rope, layer, batch, cache, index)?;
         let x = (x + attn)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp = self.mlp.forward(&normed, &mut Trace::off(), "")?;
@@ -309,28 +308,23 @@ impl Model {
     /// The cache is written but its lengths are not moved. Whoever asked for
     /// the pass records that it happened, because a pass that failed part way
     /// must not leave the bookkeeping claiming it did not.
-    pub fn forward_batch(&self, batch: &Batch, cache: &SlotCache) -> Result<Tensor> {
-        batch.validate()?;
-        for (&slot, &start) in batch.slots.iter().zip(&batch.starts) {
-            if cache.length(slot) != start {
-                return Err(Error::Config(format!(
-                    "slot {slot} holds {} tokens, the batch starts at {start}",
-                    cache.length(slot)
-                )));
-            }
-        }
+    pub fn forward_batch(&self, batch: &Batch, cache: &PagedCache) -> Result<Tensor> {
+        let index = PassIndex {
+            write_slots: cache.write_index(batch, &self.device)?,
+            read_blocks: cache.read_index(batch, &self.device)?,
+            positions: batch.positions(&self.device)?,
+            mask: batch.mask(self.dtype, &self.device)?,
+        };
 
         let ids = Tensor::from_slice(&batch.tokens, (batch.rows, batch.seq), &self.device)?;
-        let positions = batch.positions(&self.device)?;
-        let mask = batch.mask(self.dtype, &self.device)?;
-
         let mut x = self
             .embed_tokens
             .index_select(&ids.flatten_all()?, 0)?
             .reshape((batch.rows, batch.seq, ()))?;
         for (layer, block) in self.blocks.iter().enumerate() {
-            x = block.forward_batch(&x, &self.rope, layer, batch, cache, &positions, &mask)?;
+            x = block.forward_batch(&x, &self.rope, layer, batch, cache, &index)?;
         }
+
         let last = x.narrow(1, batch.seq - 1, 1)?.contiguous()?;
         let logits = self.lm_head.forward(&self.norm.forward(&last)?)?;
         Ok(logits.reshape((batch.rows, ()))?)

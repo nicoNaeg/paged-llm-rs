@@ -11,6 +11,12 @@ Each mutation is applied to the source, the suites are run, and the source is
 restored whether they passed, failed or crashed. A mutation no suite catches is
 reported and makes this exit non-zero.
 
+One candidate was tried and removed rather than left red: filling the padding of
+a read rectangle with another sequence's block instead of the row's own. Nothing
+catches it, and nothing should, because the mask hides that padding whatever is
+behind it. The choice is defence in depth against a future mask defect, not a
+correctness requirement, and a mutation list is for defects.
+
     make mutate
 
 The full-scale suite joins in when PAGEDLLM_MODEL_DIR and the two reference
@@ -75,26 +81,30 @@ MUTATIONS = [
         "                let visible = longest - 1;",
     ),
     (
+        "a block table resolved as if the blocks were consecutive",
+        ROOT / "crates/pagedllm/src/blocks.rs",
+        "        Some(block as usize * self.block_size + position % self.block_size)",
+        "        Some(position)",
+    ),
+    (
+        "a token's key vector scattered without being made token-major first",
+        BATCH,
+        "            Ok(t.transpose(1, 2)?.contiguous()?.reshape(((), width))?)",
+        "            Ok(t.reshape(((), width))?.contiguous()?)",
+    ),
+    (
         "every row given the positions of the first one",
         BATCH,
         "                positions.push(u32::try_from(start + offset).unwrap_or(u32::MAX));",
         "                positions.push(u32::try_from(offset).unwrap_or(u32::MAX));",
     ),
     (
-        "a row written into the slot at its own index instead of its slot's",
-        BATCH,
-        "            keys.narrow(0, slot, 1)?\n"
-        "                .slice_set(&k.narrow(0, row, 1)?.contiguous()?, 2, start)?;",
-        "            keys.narrow(0, row, 1)?\n"
-        "                .slice_set(&k.narrow(0, row, 1)?.contiguous()?, 2, start)?;",
-    ),
-    (
         "the cache read before this pass is written into it",
         ATTENTION,
-        "        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;\n"
-        "        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;",
-        "        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;\n"
-        "        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;",
+        "        cache.write(layer, &k, &v, &index.write_slots)?;\n"
+        "        let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;",
+        "        let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;\n"
+        "        cache.write(layer, &k, &v, &index.write_slots)?;",
     ),
 ]
 
