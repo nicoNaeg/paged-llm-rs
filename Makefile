@@ -1,4 +1,4 @@
-.PHONY: build server test test-metal test-model smoke mutate bench lint fmt venv model fixtures reference
+.PHONY: build server test test-metal test-model smoke bench-concurrency mutate bench lint fmt venv model fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
@@ -33,6 +33,10 @@ test-model:
 # prints the throughput of one sequence against the contiguous cache.
 smoke: build
 	python3 scripts/smoke-server.py
+
+# What continuous batching buys against what the reservation costs.
+bench-concurrency: build
+	python3 scripts/bench-concurrency.py
 
 # Puts each defect the forward-pass tests exist for back, and checks they fail.
 # Adds the full-scale suite when the checkpoint and its reference dumps are

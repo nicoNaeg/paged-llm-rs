@@ -68,8 +68,34 @@ impl Rope {
         let seq = x.dim(D::Minus2)?;
         let cos = self.cos.narrow(0, offset, seq)?;
         let sin = self.sin.narrow(0, offset, seq)?;
+        Self::rotate(x, &cos, &sin)
+    }
+
+    /// Rotate `x` where every row of the batch sits at its own positions.
+    ///
+    /// `positions` is `[batch, seq]`. A batch of decoding sequences is exactly
+    /// this case: each one is one token further along than the last time it ran,
+    /// and none of them agree on where they are. Taking a single offset, as the
+    /// method above does, only works while one sequence runs at a time.
+    pub fn apply_at(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        let (batch, _, seq, _) = x.dims4()?;
+        let flat = positions.flatten_all()?;
+        // Gathered into `[batch, 1, seq, head_dim]`, so one table row reaches
+        // every head of the token it belongs to.
+        let cos = self
+            .cos
+            .index_select(&flat, 0)?
+            .reshape((batch, 1, seq, ()))?;
+        let sin = self
+            .sin
+            .index_select(&flat, 0)?
+            .reshape((batch, 1, seq, ()))?;
+        Self::rotate(x, &cos, &sin)
+    }
+
+    fn rotate(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let rotated = Self::rotate_half(x)?;
-        Ok((x.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?)
+        Ok((x.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?)?)
     }
 
     /// `[x1, x2] -> [-x2, x1]` over the last dimension.

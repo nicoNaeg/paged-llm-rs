@@ -129,7 +129,7 @@ fn the_real_model_matches_the_reference_at_every_layer() {
     let model = Model::load_as(&model_dir, &Device::Cpu, Some(DType::F32)).expect("load the model");
 
     let mut trace = Trace::recording();
-    let logits = model.forward_traced(&prompt, 0, None, &mut trace).unwrap();
+    let logits = model.forward_traced(&prompt, 0, &mut trace).unwrap();
 
     let mut failures = Vec::new();
     let mut deepest = (0f32, String::new());
@@ -177,7 +177,7 @@ fn the_metal_backend_matches_the_reference_in_f32() {
 
     let mut trace = Trace::recording();
     let logits = model
-        .forward_traced(&prompt, 0, None, &mut trace)
+        .forward_traced(&prompt, 0, &mut trace)
         .unwrap()
         .to_device(&Device::Cpu)
         .unwrap();
@@ -230,7 +230,7 @@ fn bf16_on_metal_matches_a_reference_that_ran_in_bf16() {
 
     let mut trace = Trace::recording();
     let logits = model
-        .forward_traced(&prompt, 0, None, &mut trace)
+        .forward_traced(&prompt, 0, &mut trace)
         .unwrap()
         .to_device(&Device::Cpu)
         .unwrap();

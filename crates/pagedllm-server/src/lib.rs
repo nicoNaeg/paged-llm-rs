@@ -9,5 +9,5 @@ pub mod engine;
 pub mod openai;
 pub mod routes;
 
-pub use engine::{Engine, Event};
+pub use engine::{Engine, Event, PoolConfig};
 pub use routes::{AppState, router};

@@ -14,7 +14,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::cache::KvCache;
+use crate::batch::{Batch, SlotCache};
 use crate::config::Config;
 use crate::weights::Weights;
 use crate::{Error, Result};
@@ -93,20 +93,14 @@ impl Block {
         x: &Tensor,
         rope: &Rope,
         offset: usize,
-        cache: Option<(&mut KvCache, usize)>,
         trace: &mut Trace,
         prefix: &str,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         trace.record(&format!("{prefix}.input_layernorm.out"), &normed);
-        let attn = self.self_attn.forward(
-            &normed,
-            rope,
-            offset,
-            cache,
-            trace,
-            &format!("{prefix}.self_attn"),
-        )?;
+        let attn =
+            self.self_attn
+                .forward(&normed, rope, offset, trace, &format!("{prefix}.self_attn"))?;
         let x = (x + attn)?;
 
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -116,6 +110,27 @@ impl Block {
         let out = (x + mlp)?;
         trace.record(&format!("{prefix}.out"), &out);
         Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &Rope,
+        layer: usize,
+        batch: &Batch,
+        cache: &SlotCache,
+        positions: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn = self
+            .self_attn
+            .forward_batch(&normed, rope, layer, batch, cache, positions, mask)?;
+        let x = (x + attn)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp = self.mlp.forward(&normed, &mut Trace::off(), "")?;
+        Ok((x + mlp)?)
     }
 }
 
@@ -238,27 +253,22 @@ impl Model {
         })
     }
 
-    /// Logits for one sequence, shaped `[1, tokens.len(), vocab_size]`.
+    /// Logits for one sequence with no cache, `[1, tokens.len(), vocab_size]`.
+    ///
+    /// Every position is projected, which serving never needs. It is what the
+    /// comparison against the reference implementation reads, and it is the path
+    /// the batched one below is checked against.
     pub fn forward(&self, tokens: &[u32]) -> Result<Tensor> {
-        self.forward_traced(tokens, 0, None, &mut Trace::off())
-    }
-
-    /// Logits for `tokens`, continuing the sequence whose keys and values are
-    /// already in `cache`, and adding this step's to it.
-    pub fn forward_cached(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Tensor> {
-        let offset = cache.tokens();
-        self.forward_traced(tokens, offset, Some(cache), &mut Trace::off())
+        self.forward_traced(tokens, 0, &mut Trace::off())
     }
 
     /// Same, recording every intermediate into `trace`.
     ///
-    /// `offset` is the position the first token sits at, which is zero while
-    /// there is no cache to continue from.
+    /// `offset` is the position the first token sits at.
     pub fn forward_traced(
         &self,
         tokens: &[u32],
         offset: usize,
-        cache: Option<&mut KvCache>,
         trace: &mut Trace,
     ) -> Result<Tensor> {
         if tokens.is_empty() {
@@ -270,22 +280,14 @@ impl Model {
         let mut x = self.embed_tokens.index_select(&ids, 0)?.unsqueeze(0)?;
         trace.record("model.embed_tokens.out", &x);
 
-        let mut cache = cache;
         for (layer, block) in self.blocks.iter().enumerate() {
             x = block.forward(
                 &x,
                 &self.rope,
                 offset,
-                cache.as_deref_mut().map(|c| (c, layer)),
                 trace,
                 &format!("model.layers.{layer}"),
             )?;
-        }
-        if let Some(cache) = cache {
-            // Once per pass rather than once per layer: every layer caches the
-            // same positions, so counting per layer would multiply the sequence
-            // length by the depth of the model.
-            cache.advance(tokens.len());
         }
 
         let x = self.norm.forward(&x)?;
@@ -295,6 +297,43 @@ impl Model {
         trace.record("lm_head.out", &logits);
         trace.record("logits", &logits);
         Ok(logits)
+    }
+
+    /// Logits for the last token of every row, `[rows, vocab_size]`.
+    ///
+    /// Only the last position of a row predicts anything. The others passed
+    /// through the model to fill the cache, and projecting them to a vocabulary
+    /// of a hundred and fifty thousand would be the largest matrix multiply in a
+    /// prefill, done for nothing: on a 500-token prompt that is 500 rows of
+    /// logits produced so that 499 can be dropped.
+    /// The cache is written but its lengths are not moved. Whoever asked for
+    /// the pass records that it happened, because a pass that failed part way
+    /// must not leave the bookkeeping claiming it did not.
+    pub fn forward_batch(&self, batch: &Batch, cache: &SlotCache) -> Result<Tensor> {
+        batch.validate()?;
+        for (&slot, &start) in batch.slots.iter().zip(&batch.starts) {
+            if cache.length(slot) != start {
+                return Err(Error::Config(format!(
+                    "slot {slot} holds {} tokens, the batch starts at {start}",
+                    cache.length(slot)
+                )));
+            }
+        }
+
+        let ids = Tensor::from_slice(&batch.tokens, (batch.rows, batch.seq), &self.device)?;
+        let positions = batch.positions(&self.device)?;
+        let mask = batch.mask(self.dtype, &self.device)?;
+
+        let mut x = self
+            .embed_tokens
+            .index_select(&ids.flatten_all()?, 0)?
+            .reshape((batch.rows, batch.seq, ()))?;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            x = block.forward_batch(&x, &self.rope, layer, batch, cache, &positions, &mask)?;
+        }
+        let last = x.narrow(1, batch.seq - 1, 1)?.contiguous()?;
+        let logits = self.lm_head.forward(&self.norm.forward(&last)?)?;
+        Ok(logits.reshape((batch.rows, ()))?)
     }
 
     /// The architecture this model was loaded at.

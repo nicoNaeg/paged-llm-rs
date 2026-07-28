@@ -11,12 +11,13 @@
 //! synchronous engine stays testable and profilable without a runtime.
 
 pub mod backend;
-pub mod cache;
+pub mod batch;
 pub mod chat;
 pub mod config;
 pub mod error;
 pub mod model;
 pub mod sampler;
+pub mod scheduler;
 pub mod session;
 pub mod tokenizer;
 pub mod weights;
@@ -26,12 +27,13 @@ pub mod weights;
 pub use candle_core::{DType, Device};
 
 pub use backend::Backend;
-pub use cache::KvCache;
+pub use batch::{Batch, CacheConfig, SlotCache};
 pub use chat::ChatTemplate;
 pub use config::{Config, GenerationConfig};
 pub use error::{Error, Result};
 pub use model::{Model, Trace};
 pub use sampler::{Rng, Sampling};
-pub use session::{Finish, Request, Session};
+pub use scheduler::{Metrics, Plan, Scheduler, Sequence};
+pub use session::{Finish, Request};
 pub use tokenizer::{IncrementalDecoder, Tokenizer};
 pub use weights::Weights;

@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 2 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, and an `OpenAI`-compatible server generates from it over HTTP with streaming. The throughput figures below are the single-sequence baseline that the next three stages exist to beat, and every one of them comes with the command that reproduces it.
+**Status: stage 3 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a pre-allocated cache. That cache is the layout stage 5 replaces, and the figures below are what it costs, including the one this stage could not explain.
 
 ## Design
 
@@ -142,13 +142,55 @@ The shape of that table is the result, not the peak figure. A token costs 14 ms 
 
 What it is enough to say now is that this is the baseline. The cache is one unbroken run of memory per sequence, grown by reallocating, which is the layout stage 5 replaces with a pool of fixed-size blocks. Measuring it before replacing it is the point of building it this way.
 
+## Continuous batching, and what the reservation costs
+
+    make bench-concurrency
+
+The scheduler hands out slots from a pool allocated once, `[slots, kv_heads, max_seq, head_dim]` per layer. A sequence holds a slot for its whole life. Admission comes first and takes the whole pass, so a prompt arriving stalls everything already decoding, which is the design vLLM shipped before chunked prefill and the stall stage 8 exists to remove. When the pool is full a sequence waits: with a reservation per sequence the unit that would be evicted is the whole reservation, so preemption would measure the policy rather than the structure.
+
+Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 32 slots of 1024 tokens, 128 tokens each:
+
+| clients | total tokens/s | per client | ttft ms | p50 s |
+|---------|----------------|------------|---------|-------|
+| 1 | 54.0 | 54.0 | 27 | 2.37 |
+| 2 | 57.6 | 28.8 | 40 | 4.45 |
+| 4 | 75.2 | 18.8 | 66 | 6.81 |
+| 8 | 88.7 | 11.1 | 117 | 11.54 |
+| 16 | 88.9 | 5.6 | 220 | 23.03 |
+| 32 | 92.2 | 2.9 | 427 | 44.40 |
+
+### The reservation
+
+Qwen3-0.6B costs 114 688 bytes of cache per token, which is 28 layers of keys and values across 8 grouped heads of 128 in bf16. Thirty-two slots of a thousand tokens is therefore 3.50 GiB, allocated before a single request arrives, and the requests above touch 0.47 GiB of it. **87 % of the pool is held and never read.** That number is not a defect of this implementation; it is what reserving a contiguous run per sequence means, and it is the number a paged cache exists to remove.
+
+### The number this stage could not explain
+
+Batching should be close to free. A decode step reads every weight of the model once whatever rides along, so eight sequences should cost about what one costs. They do not: throughput rises 1.7 times between one client and thirty-two, and stops climbing at eight.
+
+    cargo run --release --features metal --example step_cost -- models/Qwen3-0.6B
+
+| rows | step ms | per row ms | the same rows as one prefill |
+|------|---------|------------|------------------------------|
+| 1 | 37.0 | 37.0 | 37.4 |
+| 4 | 125.7 | 31.4 | 46.3 |
+| 8 | 251.6 | 31.5 | 48.0 |
+| 32 | 1164.2 | 36.4 | 67.3 |
+
+A step costs about 35 ms per row whatever the batch, and the last column is why that is strange: pushing the same thirty-two rows through the model as one sequence's prompt costs 67 ms rather than 1164. Identical matrix work, seventeen times apart.
+
+What was ruled out, each by measurement rather than by reading: the per-slot cache writes are 8 % of the step; gathering the batch's slots row by row is not it, since a fast path that reads a consecutive run in one narrow changed nothing; a plain matrix multiply is flat in its rows, 0.003 ms whether one or a hundred and twenty-eight; so is a batched one, 0.27 ms at sixteen entries against 0.43 at five hundred and twelve. Dropping a transposed copy of the keys took 21 % off. Removing the copy that expands eight key heads into sixteen, by folding the group into the query dimension instead, took nothing off, and is kept because it is one fewer copy rather than because it helped.
+
+So this is an open question, not a result, and it is the reason the next measurement is a profile rather than another guess. Micro-benchmarks have been asked six times and have stopped narrowing it. Stage 6 is where Instruments gets to answer it, and this table is what it will be answering.
+
+It also sets the terms of the stage 5 comparison honestly in advance. A hand-written attention kernel will read the cache in place with no gather, no expansion and no transposed copy, so it will remove whatever this is along with the reservation. The gain will be large, and the README will have to say how much of it is paging and how much is the copies, rather than letting the number stand for both.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
 
 1. **Model forward pass** (built): safetensors loading, RMSNorm, RoPE, grouped-query attention with the query and key norms Qwen3 adds, SwiGLU, on candle primitives. Checked against the reference implementation at every module boundary.
 2. **Server** (built): `OpenAI`-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time, against a KV cache for one sequence.
-3. **Continuous batching, contiguous cache** (planned): the queue, the scheduler and the step loop, against a KV cache that is still one reserved buffer per sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
+3. **Continuous batching, contiguous cache** (built): the queue, the scheduler and the step loop, against a pool of pre-allocated slots, one reserved buffer per resident sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
 4. **Block allocator** (planned): the paged layout as pure logic, no GPU involved, allocation, release, reference counting and block tables, fully unit tested.
 5. **Paged attention kernel** (planned): the Metal kernel that reads keys and values through a block table, and its integration into the attention layer.
 6. **Benchmarks and profiling** (planned): against `llama-server` and `mistral.rs` on the same machine with the same model, plus a GPU profile of the kernel. The delta between stages 3 and 5 is the headline result.
@@ -184,6 +226,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device
     make smoke       drive the server over HTTP and print its throughput
+    make bench-concurrency   what batching buys and what the reservation costs
     make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets
 

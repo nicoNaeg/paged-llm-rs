@@ -6,7 +6,7 @@ use super::Trace;
 use super::layers::{Linear, RmsNorm};
 use super::rope::Rope;
 use crate::Result;
-use crate::cache::KvCache;
+use crate::batch::{Batch, SlotCache};
 
 /// One attention block.
 #[derive(Debug)]
@@ -63,7 +63,6 @@ impl Attention {
         x: &Tensor,
         rope: &Rope,
         offset: usize,
-        cache: Option<(&mut KvCache, usize)>,
         trace: &mut Trace,
         prefix: &str,
     ) -> Result<Tensor> {
@@ -92,14 +91,6 @@ impl Attention {
         let q = rope.apply(&q, offset)?;
         let k = rope.apply(&k, offset)?;
 
-        // Cached after the rotation, never before: the rotation depends on the
-        // absolute position, so caching raw keys would mean rotating the whole
-        // history again on every step, which is what the cache exists to avoid.
-        let (k, v) = match cache {
-            Some((cache, layer)) => cache.append(layer, &k, &v)?,
-            None => (k, v),
-        };
-
         let group = self.num_heads / self.num_kv_heads;
         let k = repeat_kv(&k, group)?;
         let v = repeat_kv(&v, group)?;
@@ -119,6 +110,67 @@ impl Attention {
         trace.record(&format!("{prefix}.o_proj.out"), &out);
         trace.record(&format!("{prefix}.out"), &out);
         Ok(out)
+    }
+
+    /// Attend for a batch of sequences reading a shared, pre-allocated cache.
+    ///
+    /// The single-sequence path above owns its cache and grows it. This one is
+    /// handed a slot in a pool it does not own, writes into it in place, and
+    /// reads back a rectangle every row shares. That difference is the whole of
+    /// stage 3.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch(
+        &self,
+        x: &Tensor,
+        rope: &Rope,
+        layer: usize,
+        batch: &Batch,
+        cache: &SlotCache,
+        positions: &Tensor,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let (rows, seq, _) = x.dims3()?;
+
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_heads, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
+
+        let q = self.q_norm.forward(&q)?.transpose(1, 2)?.contiguous()?;
+        let k = self.k_norm.forward(&k)?.transpose(1, 2)?.contiguous()?;
+        let v = v.transpose(1, 2)?.contiguous()?;
+
+        let q = rope.apply_at(&q, positions)?;
+        let k = rope.apply_at(&k, positions)?;
+
+        // Written before the read, so a row attends to the token it is
+        // producing as well as to its history. Writing after would leave every
+        // query one position short of itself.
+        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;
+        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;
+
+        let group = self.num_heads / self.num_kv_heads;
+        let keys = repeat_kv(&keys, group)?;
+        let values = repeat_kv(&values, group)?;
+
+        let scores = (q.matmul(&keys.transpose(D::Minus2, D::Minus1)?)? * self.scale)?;
+        let scores = scores.broadcast_add(mask)?;
+        let weights = softmax_last_dim(&scores)?;
+
+        let out = weights.matmul(&values)?.transpose(1, 2)?.reshape((
+            rows,
+            seq,
+            self.num_heads * self.head_dim,
+        ))?;
+        self.o_proj.forward(&out)
     }
 }
 

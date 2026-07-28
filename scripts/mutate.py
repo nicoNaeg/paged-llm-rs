@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ATTENTION = ROOT / "crates/pagedllm/src/model/attention.rs"
 LAYERS = ROOT / "crates/pagedllm/src/model/layers.rs"
 ROPE = ROOT / "crates/pagedllm/src/model/rope.rs"
+BATCH = ROOT / "crates/pagedllm/src/batch.rs"
 
 # (what the mistake is, file, the code as written, the code with the defect)
 MUTATIONS = [
@@ -67,9 +68,37 @@ MUTATIONS = [
         "        let gated = (gate.silu()? * up)?;",
         "        let gated = (up.silu()? * gate)?;",
     ),
+    (
+        "a row allowed to read past its own end into a neighbour's cache",
+        BATCH,
+        "                let visible = start + offset;",
+        "                let visible = longest - 1;",
+    ),
+    (
+        "every row given the positions of the first one",
+        BATCH,
+        "                positions.push(u32::try_from(start + offset).unwrap_or(u32::MAX));",
+        "                positions.push(u32::try_from(offset).unwrap_or(u32::MAX));",
+    ),
+    (
+        "a row written into the slot at its own index instead of its slot's",
+        BATCH,
+        "            keys.narrow(0, slot, 1)?\n"
+        "                .slice_set(&k.narrow(0, row, 1)?.contiguous()?, 2, start)?;",
+        "            keys.narrow(0, row, 1)?\n"
+        "                .slice_set(&k.narrow(0, row, 1)?.contiguous()?, 2, start)?;",
+    ),
+    (
+        "the cache read before this pass is written into it",
+        ATTENTION,
+        "        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;\n"
+        "        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;",
+        "        let (keys, values) = cache.read(layer, &batch.slots, batch.longest())?;\n"
+        "        cache.write(layer, &k, &v, &batch.slots, &batch.starts)?;",
+    ),
 ]
 
-SUITES = [("fixture", ["--test", "forward"])]
+SUITES = [("fixture", ["--test", "forward"]), ("batching", ["--test", "batching"])]
 if all(
     os.environ.get(name)
     for name in (

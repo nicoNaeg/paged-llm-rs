@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use pagedllm::{Backend, DType, GenerationConfig};
-use pagedllm_server::{AppState, Engine, router};
+use pagedllm_server::{AppState, Engine, PoolConfig, router};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Dtype {
@@ -36,6 +36,18 @@ struct Args {
     /// Token budget for a request that names none.
     #[arg(long, default_value_t = 512)]
     max_tokens: usize,
+    /// Tokens reserved per resident sequence, prompt and completion together.
+    /// This is the reservation the paged cache exists to remove: every slot
+    /// costs it whatever the request turns out to need.
+    #[arg(long, default_value_t = 2048)]
+    max_model_len: usize,
+    /// Sequences resident at once. Each one costs a whole reservation.
+    #[arg(long, default_value_t = 16)]
+    max_sequences: usize,
+    /// Rows in one decode pass, capped separately from the slots so a batch can
+    /// be limited without shrinking the cache.
+    #[arg(long, default_value_t = 16)]
+    max_batch: usize,
 }
 
 #[tokio::main]
@@ -54,7 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let generation = Arc::new(GenerationConfig::from_dir(&args.model)?);
-    let engine = Engine::start(args.model.clone(), device.clone(), dtype)
+    let pool = PoolConfig {
+        max_seq: args.max_model_len,
+        slots: args.max_sequences,
+        max_batch: args.max_batch,
+    };
+    let engine = Engine::start(args.model.clone(), device.clone(), dtype, pool)
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -69,6 +86,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         generation.temperature, generation.top_p, generation.top_k
     );
     println!("  stop     {:?}", generation.eos_token_ids);
+    // Printed because it is the number stage 5 has to raise. A slot costs its
+    // whole reservation the moment a sequence takes it, so this is the concurrency
+    // ceiling, decided before any request arrives.
+    println!(
+        "  cache    {} slots of {} tokens, {:.2} GiB reserved, {} bytes a token",
+        pool.slots,
+        pool.max_seq,
+        engine.cache_bytes() as f64 / (1u64 << 30) as f64,
+        engine.cache_bytes() / (pool.slots * pool.max_seq).max(1)
+    );
 
     let state = AppState {
         engine,
