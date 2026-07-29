@@ -16,6 +16,7 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::batch::{Batch, PagedCache};
 use crate::config::Config;
+use crate::kernels::AttentionKind;
 use crate::weights::Weights;
 use crate::{Error, Result};
 
@@ -121,11 +122,12 @@ impl Block {
         batch: &Batch,
         cache: &PagedCache,
         index: &PassIndex,
+        attention: AttentionKind,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn = self
             .self_attn
-            .forward_batch(&normed, rope, layer, batch, cache, index)?;
+            .forward_batch(&normed, rope, layer, batch, cache, index, attention)?;
         let x = (x + attn)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp = self.mlp.forward(&normed, &mut Trace::off(), "")?;
@@ -144,6 +146,7 @@ pub struct Model {
     config: Config,
     device: Device,
     dtype: DType,
+    attention: AttentionKind,
 }
 
 impl Model {
@@ -249,6 +252,7 @@ impl Model {
             config,
             device: device.clone(),
             dtype,
+            attention: AttentionKind::default(),
         })
     }
 
@@ -322,12 +326,26 @@ impl Model {
             .index_select(&ids.flatten_all()?, 0)?
             .reshape((batch.rows, batch.seq, ()))?;
         for (layer, block) in self.blocks.iter().enumerate() {
-            x = block.forward_batch(&x, &self.rope, layer, batch, cache, &index)?;
+            x = block.forward_batch(&x, &self.rope, layer, batch, cache, &index, self.attention)?;
         }
 
         let last = x.narrow(1, batch.seq - 1, 1)?.contiguous()?;
         let logits = self.lm_head.forward(&self.norm.forward(&last)?)?;
         Ok(logits.reshape((batch.rows, ()))?)
+    }
+
+    /// Choose which attention implementation runs.
+    ///
+    /// Both stay reachable rather than one replacing the other, so the
+    /// comparison between them is a flag and the tensor path keeps its job as
+    /// the oracle the kernel is checked against on hardware.
+    pub fn set_attention(&mut self, attention: AttentionKind) {
+        self.attention = attention;
+    }
+
+    /// Which attention implementation this model runs.
+    pub fn attention(&self) -> AttentionKind {
+        self.attention
     }
 
     /// The architecture this model was loaded at.

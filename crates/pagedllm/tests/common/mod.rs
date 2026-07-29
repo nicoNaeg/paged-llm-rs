@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared by the tests that read the committed fixture.
 
 use std::path::{Path, PathBuf};

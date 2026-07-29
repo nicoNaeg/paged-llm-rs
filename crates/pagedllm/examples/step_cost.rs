@@ -14,7 +14,9 @@
 
 use std::time::Instant;
 
-use pagedllm::{Backend, Batch, BlockAllocator, BlockTable, CacheConfig, Model, PagedCache};
+use pagedllm::{
+    AttentionKind, Backend, Batch, BlockAllocator, BlockTable, CacheConfig, Model, PagedCache,
+};
 
 const CONTEXT: usize = 256;
 const ITERATIONS: u32 = 10;
@@ -26,21 +28,33 @@ fn main() -> pagedllm::Result<()> {
     });
     let backend = Backend::detect();
     let device = backend.device()?;
-    let model = Model::load(&dir, &device)?;
-    let config = model.config();
-    println!("backend {backend}, {} layers", config.num_hidden_layers);
+    let mut model = Model::load(&dir, &device)?;
+    let (layers, kv_heads, head_dim) = {
+        let config = model.config();
+        (
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+        )
+    };
+    println!("backend {backend}, {layers} layers");
 
     let prompt: Vec<u32> = (0..CONTEXT)
         .map(|i| u32::try_from(i % 1000).unwrap() + 10)
         .collect();
 
-    for block_size in [1024usize, 16] {
+    for (block_size, kind) in [
+        (1024usize, AttentionKind::Tensor),
+        (16, AttentionKind::Tensor),
+        (16, AttentionKind::Kernel),
+    ] {
+        model.set_attention(kind);
         println!(
             "\n{}",
-            if block_size >= 1024 {
-                "one block a sequence, which is a reservation"
-            } else {
-                "blocks of sixteen, which is paging"
+            match (block_size, kind) {
+                (1024, _) => "a reservation, gathered by the tensor path",
+                (_, AttentionKind::Tensor) => "paging, gathered by the tensor path",
+                (_, AttentionKind::Kernel) => "paging, read in place by the kernel",
             }
         );
         println!(
@@ -55,9 +69,9 @@ fn main() -> pagedllm::Result<()> {
                 CacheConfig {
                     block_size,
                     blocks,
-                    kv_heads: config.num_key_value_heads,
-                    head_dim: config.head_dim,
-                    layers: config.num_hidden_layers,
+                    kv_heads,
+                    head_dim,
+                    layers,
                 },
                 model.dtype(),
                 &device,

@@ -7,6 +7,7 @@ use super::layers::{Linear, RmsNorm};
 use super::rope::Rope;
 use crate::Result;
 use crate::batch::{Batch, PagedCache};
+use crate::kernels::{AttentionKind, PagedAttention};
 
 /// One attention block.
 #[derive(Debug)]
@@ -127,6 +128,7 @@ impl Attention {
         batch: &Batch,
         cache: &PagedCache,
         index: &PassIndex,
+        attention: AttentionKind,
     ) -> Result<Tensor> {
         let (rows, seq, _) = x.dims3()?;
 
@@ -154,6 +156,37 @@ impl Attention {
         // producing as well as to its history. Writing after would leave every
         // query one position short of itself.
         cache.write(layer, &k, &v, &index.write_slots)?;
+
+        // The kernel reads the blocks where they are. It only covers a decode,
+        // where the gather below costs the most and buys the least: one token of
+        // query against a rectangle as wide as the longest resident sequence.
+        if attention == AttentionKind::Kernel && seq == 1 {
+            let (k_pool, v_pool) = cache.layer(layer);
+            let op = PagedAttention::new(
+                k_pool,
+                v_pool,
+                batch,
+                cache.config().block_size,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                // The scale is 1/sqrt(head_dim), which f32 holds exactly enough of.
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    self.scale as f32
+                },
+            )?;
+            let q = q
+                .transpose(1, 2)?
+                .reshape((rows, self.num_heads, self.head_dim))?;
+            let out = op.forward(&q.contiguous()?)?.reshape((
+                rows,
+                seq,
+                self.num_heads * self.head_dim,
+            ))?;
+            return self.o_proj.forward(&out);
+        }
+
         let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;
 
         // Grouped-query attention without materialising the group. Expanding

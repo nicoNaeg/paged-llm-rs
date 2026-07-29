@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pagedllm::{
-    Batch, CacheConfig, DType, Device, Finish, IncrementalDecoder, Model, PagedCache, Plan,
-    Request, Scheduler, Sequence, Tokenizer,
+    AttentionKind, Batch, CacheConfig, DType, Device, Finish, IncrementalDecoder, Model,
+    PagedCache, Plan, Request, Scheduler, Sequence, Tokenizer,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -54,6 +54,8 @@ pub struct PoolConfig {
     pub blocks: usize,
     /// Rows in one decode pass, capped independently of the blocks.
     pub max_batch: usize,
+    /// Which attention implementation runs on a decode.
+    pub attention: AttentionKind,
 }
 
 /// A handle to the engine thread.
@@ -87,7 +89,9 @@ impl Engine {
             .name("pagedllm-engine".into())
             .spawn(move || {
                 let started = (|| {
-                    let model = Model::load_as(&dir, &device, dtype).map_err(|e| e.to_string())?;
+                    let mut model =
+                        Model::load_as(&dir, &device, dtype).map_err(|e| e.to_string())?;
+                    model.set_attention(pool.attention);
                     let config = model.config();
                     let cache_config = CacheConfig {
                         block_size: pool.block_size,

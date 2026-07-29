@@ -234,6 +234,12 @@ impl PagedCache {
         &self.config
     }
 
+    /// One layer's keys and values, as the flat `[slots, kv_heads * head_dim]`
+    /// pools a kernel indexes directly.
+    pub fn layer(&self, layer: usize) -> (&Tensor, &Tensor) {
+        (&self.keys[layer], &self.values[layer])
+    }
+
     /// Write a batch's keys and values into the blocks its rows hold.
     ///
     /// One scatter per layer whatever the batch, where the slot cache needed one

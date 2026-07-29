@@ -36,6 +36,8 @@ ATTENTION = ROOT / "crates/pagedllm/src/model/attention.rs"
 LAYERS = ROOT / "crates/pagedllm/src/model/layers.rs"
 ROPE = ROOT / "crates/pagedllm/src/model/rope.rs"
 BATCH = ROOT / "crates/pagedllm/src/batch.rs"
+KERNEL = ROOT / "crates/pagedllm/src/kernels/paged_attention.rs"
+MSL = ROOT / "crates/pagedllm/src/kernels/paged_attention.metal"
 
 # (what the mistake is, file, the code as written, the code with the defect)
 MUTATIONS = [
@@ -99,16 +101,43 @@ MUTATIONS = [
         "                positions.push(u32::try_from(offset).unwrap_or(u32::MAX));",
     ),
     (
-        "the cache read before this pass is written into it",
-        ATTENTION,
-        "        cache.write(layer, &k, &v, &index.write_slots)?;\n"
-        "        let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;",
-        "        let (keys, values) = cache.read(layer, batch, &index.read_blocks)?;\n"
-        "        cache.write(layer, &k, &v, &index.write_slots)?;",
+        "the scalar reference resolving a position without its block table",
+        KERNEL,
+        "                table[position / self.block_size] as usize * self.block_size\n"
+        "                    + position % self.block_size",
+        "                position",
+    ),
+    (
+        "the scalar reference giving every query head the first key head",
+        KERNEL,
+        "                let kv_head = head / group;",
+        "                let kv_head = 0;",
+    ),
+    (
+        "the scalar reference reading one position past its own context",
+        KERNEL,
+        "                for position in 0..ctx {",
+        "                for position in 0..ctx.saturating_sub(1).max(1) {",
+    ),
+    (
+        "a row not allowed to see the token it is producing",
+        BATCH,
+        "                let visible = start + offset;",
+        "                let visible = start.saturating_sub(1) + offset;",
+    ),
+    (
+        "the kernel given a context that stops before the new token",
+        KERNEL,
+        "            .map(|start| u32::try_from(start + 1).unwrap_or(u32::MAX))",
+        "            .map(|start| u32::try_from((*start).max(1)).unwrap_or(u32::MAX))",
     ),
 ]
 
-SUITES = [("fixture", ["--test", "forward"]), ("batching", ["--test", "batching"])]
+SUITES = [
+    ("fixture", ["--test", "forward"]),
+    ("batching", ["--test", "batching"]),
+    ("kernel", ["--test", "kernel"]),
+]
 if all(
     os.environ.get(name)
     for name in (
@@ -126,6 +155,23 @@ def run(suite: list[str]) -> bool:
     """True when the suite passes."""
     done = subprocess.run(
         ["cargo", "test", "--quiet", *suite],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    return done.returncode == 0
+
+
+def compiles() -> bool:
+    """Whether the mutated source still builds.
+
+    A mutation that does not compile fails every suite and reads as caught by
+    all of them, which says nothing: the tests never ran. This turns that into a
+    reported failure instead, because a mutation nothing executes is a mutation
+    nothing is checking.
+    """
+    done = subprocess.run(
+        ["cargo", "build", "--quiet", "--tests"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -171,11 +217,16 @@ def main() -> int:
 
         path.write_text(original.replace(written, defective, 1))
         try:
-            caught = [not run(suite) for _, suite in SUITES]
+            built = compiles()
+            caught = [not run(suite) for _, suite in SUITES] if built else []
         finally:
             path.write_text(original)
             assert path.read_text() == original, f"failed to restore {path}"
 
+        if not built:
+            print(f"{what:<{width}}{'DOES NOT BUILD':>11}")
+            survived.append(f"{what} (the mutation does not compile, so nothing ran)")
+            continue
         print(
             f"{what:<{width}}"
             + "".join(f"{'caught' if hit else 'SURVIVED':>11}" for hit in caught)

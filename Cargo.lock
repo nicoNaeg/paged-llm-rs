@@ -1484,8 +1484,11 @@ name = "pagedllm"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-metal-kernels",
+ "half",
  "minijinja",
  "minijinja-contrib",
+ "objc2-metal",
  "serde",
  "serde_json",
  "tokenizers 0.23.1",

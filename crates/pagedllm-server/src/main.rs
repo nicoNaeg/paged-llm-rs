@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use pagedllm::{Backend, DType, GenerationConfig};
+use pagedllm::{AttentionKind, Backend, DType, GenerationConfig};
 use pagedllm_server::{AppState, Engine, PoolConfig, router};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -49,6 +49,12 @@ struct Args {
     /// be limited without shrinking the cache.
     #[arg(long, default_value_t = 16)]
     max_batch: usize,
+    /// Which attention runs on a decode. `tensor` gathers the blocks into a
+    /// rectangle and uses candle's tensor ops; `kernel` is the hand-written one
+    /// that reads the blocks where they are. Both stay reachable so the
+    /// comparison between them is a flag.
+    #[arg(long, default_value = "kernel")]
+    attention: String,
 }
 
 #[tokio::main]
@@ -79,10 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let budget = args.cache_mib << 20;
     let dtype_for_pool = dtype.unwrap_or(pagedllm::DType::BF16);
+    let attention: AttentionKind = args.attention.parse()?;
     let pool = PoolConfig {
         block_size: args.block_size,
         blocks: per_token.blocks_within(budget, dtype_for_pool),
         max_batch: args.max_batch,
+        attention,
     };
     let engine = Engine::start(args.model.clone(), device.clone(), dtype, pool)
         .await
@@ -93,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sampling defaults decide what the model actually answers.
     println!("pagedllm-server {}", env!("CARGO_PKG_VERSION"));
     println!("  model    {}", args.model.display());
-    println!("  backend  {backend}");
+    println!("  backend  {backend}, attention {attention}");
     println!(
         "  sampling temperature {:?}, top_p {:?}, top_k {:?}, from the model's generation config",
         generation.temperature, generation.top_p, generation.top_k

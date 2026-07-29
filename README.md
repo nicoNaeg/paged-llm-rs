@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 4 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks. The reservation that pool replaces is still there as a setting, so the two are compared by a flag rather than by a checkout, and the figures below are that comparison.
+**Status: stage 5 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own.
 
 ## Design
 
@@ -164,20 +164,27 @@ everything else, so the two are one flag apart.
 Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 3584 MiB of cache either way, prompts of
 about ten words and 128 tokens each:
 
-| clients | reservation tok/s | paging tok/s | reservation ttft | paging ttft | reservation p95 | paging p95 |
-|---------|-------------------|--------------|------------------|-------------|-----------------|------------|
-| 1 | 52.3 | 58.9 | 32 ms | 28 ms | 2.45 s | 2.17 s |
-| 4 | 68.1 | 98.5 | 78 ms | 71 ms | 7.51 s | 5.19 s |
-| 16 | 71.2 | 144.0 | 282 ms | 260 ms | 28.76 s | 14.22 s |
-| 32 | 69.1 | 163.4 | 546 ms | 494 ms | 59.25 s | 25.06 s |
-| 64 | 68.4 | 167.3 | **30 053 ms** | **976 ms** | 119.77 s | 48.97 s |
+| clients | reservation | paging | paging and kernel |
+|---------|-------------|--------|-------------------|
+| 1 | 51.4 tok/s | 48.0 | 58.2 |
+| 4 | 64.0 | 91.9 | 124.9 |
+| 16 | 68.4 | 131.4 | 253.8 |
+| 32 | 69.6 | 149.7 | 367.7 |
+| 64 | 68.3 | 152.6 | **447.9** |
+| ttft at 64 | **30 187 ms** | 1079 ms | 983 ms |
+| p95 at 64 | 119.80 s | 53.67 s | **18.26 s** |
 
 Three things in that table, and the last one is the point.
 
-Throughput: paging reaches 2.4 times the reservation's at 64 clients, and keeps
-climbing where the reservation flattens at sixteen and then falls.
+The two gains are separate, and separating them is why the block allocator was
+wired into the serving path at stage 4 rather than kept as pure logic until the
+kernel arrived. Paging alone buys 2.2 times the throughput; the kernel on top of
+paging buys 2.9 times again. Neither number is carrying the other's weight, and a
+single 6.6 would have hidden which half came from where.
 
-Latency: half the p95 at every concurrency past four, for the same reason.
+Scaling says the same thing another way. From one client to sixty-four, the
+reservation gains 1.4 times, paging 3.2, and the kernel 7.7. A serving engine
+that does not scale with concurrency is not serving, it is queueing.
 
 And the row that says why paging exists. At 3584 MiB a reservation of 1024
 tokens buys thirty-two of them, so the thirty-third client waits for someone to
@@ -207,22 +214,81 @@ The waste it replaces is also bounded rather than open. A sequence holds at most
 one partly-filled block, sixteen tokens at 112 KiB each, where a reservation
 holds everything the request never reaches.
 
-### The number this stage still cannot explain
+## The kernel, and the question it answered
 
-A decode step should be nearly free per row, since it reads the model's weights
-once whatever rides along. It is not: 14.6 ms a row at thirty-two rows, where
-pushing the same thirty-two rows through as one sequence's prompt costs 68 ms in
-total rather than 468.
+    cargo run --release --features metal --example step_cost -- models/Qwen3-0.6B
 
-Stage 3 measured this at 36 ms a row and could not attribute it. Two fixes since
-have more than halved it, and neither was the answer: writing the batch with one
-scatter per layer instead of one call per row, and folding the grouped-query
-expansion into the query dimension rather than materialising it. The shape of the
-curve is unchanged. It is still flat per row where it should fall.
+Stage 3 measured something it could not explain: a decode step cost the same per
+row whatever the batch, where batching should make it nearly free, since a step
+reads the model's weights once however many sequences ride along. Two fixes
+halved the number without changing the shape of the curve, and the question went
+into the log with a note that the next measurement should be a profile.
 
-What has been ruled out by measurement is in the log; what has not been tried is
-a profile. Stage 6 is where Instruments answers it, and it should be pointed here
-before it is pointed at the kernel.
+It did not need one. The cost was the gather.
+
+| rows | reservation, ms a row | paging, ms a row | kernel, ms a row |
+|------|-----------------------|------------------|------------------|
+| 1 | 31.2 | 28.4 | 17.6 |
+| 4 | 21.0 | 18.0 | 9.0 |
+| 8 | 18.6 | 15.3 | 4.6 |
+| 32 | 20.4 | 14.3 | **2.1** |
+
+The first two columns are flat: every sequence added to a batch costs another
+full pass. The third falls, which is what batching is supposed to do. At
+thirty-two rows the whole step takes 66.5 ms against 458.8, and 59.4 ms is what
+the same thirty-two rows cost as one sequence's prompt, which is the shape stage
+3 said a decode should have had all along. The 17-fold gap it reported is now
+1.12.
+
+What the tensor path does, per layer and per step, is copy every resident
+sequence's keys and values into one rectangle as wide as the longest row, then
+multiply. The copy is proportional to the batch, so it cancels exactly the thing
+batching buys. The kernel reads the blocks where they are.
+
+### What the kernel is, and how it is known to be right
+
+One threadgroup per (row, head), and the work splits three ways, each chosen for
+how the reads land.
+
+Scoring gives one position to each SIMD group and splits the head across its
+thirty-two lanes, so a group reads thirty-two consecutive floats of a key vector
+at a time and `simd_sum` finishes the dot product with no barrier. The softmax
+runs over the scores in threadgroup memory in f32, which is what keeps a few
+thousand exponentials from losing their sum in bf16. The weighted sum of the
+value vectors gives one output dimension to each thread, so the threads of a
+group again read consecutive floats.
+
+The kernel is compiled from Metal Shading Language at startup, so building this
+repository needs no Xcode, and cached per dtype.
+
+Three implementations of one function exist, and each pair says something the
+others cannot.
+
+    make test          the scalar reference against the tensor path
+    make test-metal    adds the kernel against both, on hardware
+
+The tensor path gathers and multiplies, and knows nothing about block tables. The
+scalar reference walks the table token by token; it is the oracle, and it is what
+CI runs, because `MTLCreateSystemDefaultDevice` returns nil inside a hosted macOS
+runner. The kernel does what the scalar reference does, in parallel. On the GPU
+it agrees with the tensor path to 1.0e-7, which is f32 rounding.
+
+Comparing only two of them would miss a defect that moved both the same way. That
+is not hypothetical here: a reshape that split every key vector across head
+boundaries passed two differential tests at stage 4, because both sides were
+wrong identically, and only the comparison against a path that had never touched
+the pool caught it.
+
+### `unsafe_code = "deny"` still holds
+
+The whole kernel path goes through safe wrappers candle already exposes:
+`metal_device()` to compile the source, `command_encoder()` to encode into
+candle's own command buffer, `set_param` to bind the buffers, `dispatch_threads`
+to launch. No module in this workspace has taken the opt-out.
+
+Encoding into candle's command buffer rather than a private one is also what
+makes the ordering correct without a barrier written by hand: candle tracks which
+buffers a kernel wrote and inserts the barrier before the next one reads them.
 
 ## Build order
 
@@ -232,7 +298,7 @@ Each stage lands with its tests before the next one starts.
 2. **Server** (built): `OpenAI`-compatible `/v1/completions` and `/v1/chat/completions`, streamed over server-sent events, one request at a time, against a KV cache for one sequence.
 3. **Continuous batching, contiguous cache** (built): the queue, the scheduler and the step loop, against a pool of pre-allocated slots, one reserved buffer per resident sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
 4. **Block allocator** (built): the paged layout as pure logic, no GPU involved, allocation, release and block tables, fully unit tested, and wired into the serving path so the memory it buys is measured before the kernel arrives.
-5. **Paged attention kernel** (planned): the Metal kernel that reads keys and values through a block table, and its integration into the attention layer.
+5. **Paged attention kernel** (built): the Metal kernel that reads keys and values through a block table on a decode step, compiled from source at startup, checked against a scalar reference and against the tensor path it replaces.
 6. **Benchmarks and profiling** (planned): against `llama-server` and `mistral.rs` on the same machine with the same model, plus a GPU profile of the kernel. The delta between stages 3 and 5 is the headline result.
 7. **Prefix caching** (planned): a radix tree over block hashes, so requests sharing a system prompt share physical blocks instead of recomputing them.
 8. **Chunked prefill** (planned): a long prompt processed a slice per step, so an arriving request stops adding a latency spike to every sequence already decoding.
@@ -250,7 +316,8 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
 ## Repository layout
 
     crates/pagedllm/            engine: model, cache, sampler, scheduler, kernels
-    crates/pagedllm/src/model/  the Qwen3 forward pass on candle primitives
+    crates/pagedllm/src/model/    the Qwen3 forward pass on candle primitives
+    crates/pagedllm/src/kernels/  the Metal kernel and the scalar reference beside it
     crates/pagedllm/tests/      the comparisons against the reference, and their fixtures
     crates/pagedllm-server/     OpenAI-compatible HTTP server on axum
     scripts/                    the reference dumps, the mutation run, the smoke test
@@ -264,7 +331,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make server      start the server
     make server      start the server on port 8000
     make test        the CPU path, which is what CI runs
-    make test-metal  adds the tests that need a Metal device
+    make test-metal  adds the tests that need a Metal device, the kernel among them
     make smoke       drive the server over HTTP and print its throughput
     make bench-concurrency   what batching buys and what the reservation costs
     make mutate      put each defect back and check the tests fail

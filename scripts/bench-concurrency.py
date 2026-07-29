@@ -37,7 +37,11 @@ TOKENS = 128
 CONCURRENCY = (1, 4, 16, 32, 64)
 # A block as wide as the context is one block a sequence, which is a
 # reservation; sixteen is paging. Same memory, same everything else.
-LAYOUTS = ((1024, "one block a sequence, a reservation"), (16, "blocks of sixteen, paging"))
+LAYOUTS = (
+    (1024, "tensor", "a reservation, gathered by the tensor path"),
+    (16, "tensor", "paging, gathered by the tensor path"),
+    (16, "kernel", "paging, read in place by the kernel"),
+)
 
 
 def one_request(index: int) -> tuple[float, float, int]:
@@ -88,12 +92,12 @@ def main() -> int:
     if not MODEL.exists():
         raise SystemExit(f"{MODEL} is missing; run `make model` first")
 
-    for block_size, label in LAYOUTS:
-        run_layout(block_size, label)
+    for block_size, attention, label in LAYOUTS:
+        run_layout(block_size, attention, label)
     return 0
 
 
-def run_layout(block_size: int, label: str) -> None:
+def run_layout(block_size: int, attention: str, label: str) -> None:
     process = subprocess.Popen(
         [
             str(BINARY),
@@ -101,6 +105,7 @@ def run_layout(block_size: int, label: str) -> None:
             "--port", str(PORT),
             "--block-size", str(block_size),
             "--cache-mib", str(CACHE_MIB),
+            "--attention", attention,
             "--max-batch", "64",
         ],
         stdout=subprocess.DEVNULL,
