@@ -333,7 +333,10 @@ tokens and exactly 128 tokens asked for, with no spread. What is not held equal
 is the sampler, because each engine's arithmetic picks its own tokens, which
 changes nothing about a rate.
 
-Apple M4 Pro, macOS 26.5, llama.cpp b10180, mistral.rs 0.9.0.
+Apple M4 Pro, macOS 26.5, llama.cpp b10180, mistral.rs 0.9.0. The three engines
+run back to back in one invocation, which is what makes the columns comparable:
+absolute throughput on this machine drifts between sessions, so a figure here is
+worth reading against its neighbours rather than against one published elsewhere.
 
 **Output tokens a second**
 
