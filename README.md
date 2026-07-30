@@ -12,7 +12,7 @@ What runs out is the KV cache. Every token a sequence has seen leaves a key and 
 
 PagedAttention removes the reservation. The cache becomes a pool of fixed-size blocks, each sequence holds a table mapping its logical positions to physical blocks, and blocks are handed out as tokens are produced. The attention kernel then reads keys and values that are scattered across the pool, through the table, instead of walking one contiguous buffer. This is virtual memory applied to attention, page table included, and it is the reason vLLM serves more concurrent requests than the memory arithmetic suggests it should.
 
-The point here is to build that from its primitives. The block allocator, the scheduler that decides what runs on each step, the kernel that reads through a block table, the radix tree that lets two requests with a common prefix share physical blocks: all written in this repository, so the mechanics and their tradeoffs are the deliverable rather than the glue around an inference crate.
+The point here is to build that from its primitives. The block allocator, the scheduler that decides what runs on each step, the kernel that reads through a block table, the chained hash that lets two requests with a common prefix share physical blocks: all written in this repository, so the mechanics and their tradeoffs are the deliverable rather than the glue around an inference crate.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ flowchart TB
     end
     subgraph CP [Control plane]
         Q --> SCHED{scheduler, once per step}
-        SCHED -->|memory available| ADM[admit: prefill]
+        SCHED -->|prompt waiting| ADM[a slice of it, beside the decodes]
         SCHED -->|already running| DEC[continue: decode]
         SCHED -->|pool exhausted| PRE[preempt, return blocks]
         ADM --> BM[block allocator]
@@ -127,22 +127,22 @@ Chat messages are turned into text by the model's own Jinja template, rendered w
 
     make smoke
 
-Apple M4 Pro, Metal, Qwen3-0.6B in bf16, one request at a time, greedy prompt of five tokens:
+Apple M4 Pro, Metal, Qwen3-0.6B in bf16, one request at a time, greedy prompt of five tokens. The server runs on its defaults here, which is the shipped configuration: blocks of sixteen, the kernel, prefix caching and a pass budget all on.
 
 | tokens generated | seconds | tokens/s | ms per token |
 |------------------|---------|----------|--------------|
-| 16 | 0.23 | 71.0 | 14.08 |
-| 64 | 1.00 | 64.1 | 15.61 |
-| 128 | 2.31 | 55.4 | 18.05 |
-| 256 | 5.96 | 43.0 | 23.28 |
-| 512 | 17.26 | 29.7 | 33.71 |
-| 1024 | 56.65 | 18.1 | 55.32 |
+| 16 | 0.20 | 79.4 | 12.60 |
+| 64 | 0.81 | 78.7 | 12.71 |
+| 128 | 1.70 | 75.3 | 13.29 |
+| 256 | 3.70 | 69.1 | 14.47 |
+| 512 | 8.61 | 59.5 | 16.82 |
+| 1024 | 22.13 | 46.3 | 21.61 |
 
-Time to first token is 42 ms and the server is reachable 0.9 s after launch.
+Time to first token is 13 ms and the server is reachable 0.9 s after launch.
 
-The shape of that table is the result, not the peak figure. A token costs 14 ms at the start of a sequence and 55 ms a thousand tokens later, four times as much, and both the attention and the cache grow with the sequence. What this measurement does not do is separate them: appending one token to a contiguous cache copies everything already in it, and attending over the cache reads all of it, and both are linear in the length. Stage 6 profiles that; guessing at it here would be the kind of claim this README is written to avoid.
+The shape of that table is the result, not the peak figure. A token costs 12.6 ms at the start of a sequence and 21.6 ms a thousand tokens later, and what that decay is made of is only partly settled. The contiguous cache this project started with copied its whole contents on every append, and against it the same measurement decayed by 3.9 rather than 1.7; paging removed the copy and the kernel removed the gather, which is most of the difference.
 
-What it is enough to say now is that this is the baseline. The cache is one unbroken run of memory per sequence, grown by reallocating, which is the layout stage 5 replaces with a pool of fixed-size blocks. Measuring it before replacing it is the point of building it this way.
+What is left is not attributed, and the arithmetic says it is not the obvious candidate. At a thousand tokens this model's keys and values are 117 MB, which unified memory at 273 GB/s delivers in 0.43 ms, against 9 ms of measured decay. So reading a longer context accounts for under a twentieth of it. Naming a cause here without a profile pointed at it would be the kind of claim this README is written to avoid.
 
 ## Continuous batching, and what a reservation costs
 
@@ -150,10 +150,12 @@ What it is enough to say now is that this is the baseline. The cache is one unbr
 
 The scheduler hands out blocks from a pool allocated once. A sequence holds a
 list of blocks rather than a run of memory, and takes another only when its last
-one fills. Admission comes first and takes the whole pass, so a prompt arriving
-stalls everything already decoding, which is the design vLLM shipped before
-chunked prefill. That policy is still reachable with `--chunk off`, and what
-replaced it is measured against it below. When the pool runs dry the newest
+one fills. Two admission policies live behind one flag. `--chunk off` is
+prefill-first, the design vLLM shipped before chunked prefill: a prompt arriving
+takes the whole pass and stalls everything already decoding. The default slices
+that prompt across passes instead, which the last section of this README
+measures; both are in the table below, because the choice changes what a batch
+looks like. When the pool runs dry the newest
 resident sequence is evicted, its blocks are returned, and it goes back to the
 front of the queue to be recomputed. Waiting instead would deadlock: if every
 resident sequence needs a block and none can finish without one, nothing frees
@@ -607,6 +609,7 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
     crates/pagedllm/src/model/    the Qwen3 forward pass on candle primitives
     crates/pagedllm/src/kernels/  the Metal kernel and the scalar reference beside it
     crates/pagedllm/tests/      the comparisons against the reference, and their fixtures
+    crates/pagedllm/examples/   step_cost, which times a decode row against a prefill
     crates/pagedllm-server/     OpenAI-compatible HTTP server on axum
     scripts/                    the reference dumps, the mutation run, the benchmarks
     docs/                       the profile summary the README cites

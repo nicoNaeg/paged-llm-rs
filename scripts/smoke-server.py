@@ -244,7 +244,7 @@ def main() -> int:
             status == 200 and answered and whole["choices"][0]["text"] == out["choices"][0]["text"],
         )
 
-        print("\nthroughput, one sequence, contiguous cache")
+        print("\nthroughput, one sequence, on the server's defaults")
         print(f"  {'tokens':>7} {'seconds':>8} {'tok/s':>7} {'ms/token':>9}")
         for budget in (16, 64, 128, 256, 512, 1024):
             status, out, seconds = call(
