@@ -389,13 +389,10 @@ impl Scheduler {
         let budget = self.chunk?;
         // A prompt part-way through its slices finishes before a new one starts,
         // so no prompt is left half-run while another begins.
-        if !self.running.iter().any(|s| s.prompt_left > 0) {
-            self.start_next_prompt();
-        }
-        let index = self
+        let mut index = self
             .running
             .iter()
-            .position(|s| s.prompt_left > 0 && s.finish.is_none())?;
+            .position(|s| s.prompt_left > 0 && s.finish.is_none());
 
         // Decodes are taken first. They are what a client is watching, and a
         // slice that crowded them out would trade one stall for another.
@@ -409,7 +406,7 @@ impl Scheduler {
                 break;
             }
             let sequence = &self.running[row];
-            if row == index || sequence.finish.is_some() || sequence.pending.len() != 1 {
+            if Some(row) == index || sequence.finish.is_some() || sequence.pending.len() != 1 {
                 continue;
             }
             if sequence.table.blocks_needed(1) > 0 {
@@ -436,6 +433,18 @@ impl Scheduler {
         if room == 0 {
             return None;
         }
+        // A new prompt joins only now, after the residents have taken the blocks
+        // they need. Admitting it first let a resident take the last block in
+        // the same pass and left the newcomer in the running set with nothing to
+        // run, holding the place of the next prompt until something evicted it.
+        if index.is_none() {
+            self.start_next_prompt();
+            index = self
+                .running
+                .iter()
+                .position(|s| s.prompt_left > 0 && s.finish.is_none());
+        }
+        let index = index?;
         let done = {
             let s = &self.running[index];
             s.history.len() - s.prompt_left
@@ -504,6 +513,21 @@ impl Scheduler {
             return;
         };
         let shared = self.claim_prefix(&mut sequence);
+        // Claiming a prefix takes blocks of its own, so the room checked above
+        // can be gone by now, and a sequence whose whole prefix was resident
+        // still needs somewhere to write the token it is about to produce.
+        // Admitting it without that leaves it in the running set unable to run,
+        // holding the place of the next prompt until something evicts it.
+        if sequence.table.blocks_needed(1) > 0 {
+            let Some(block) = self.pool.allocate() else {
+                self.pool.free_table(&mut sequence.table);
+                sequence.pending.clone_from(&sequence.history);
+                self.waiting.push_front(sequence);
+                self.metrics.admission_stalls += 1;
+                return;
+            };
+            sequence.table.push(block);
+        }
         self.metrics.cached_tokens += shared as u64;
         self.metrics.prefilled_tokens += (prompt_len - shared) as u64;
         // Every block of it may already be resident, and it still has to run its
@@ -1303,5 +1327,44 @@ mod tests {
             scheduler.commit(&plan, &vec![7; ids]);
         }
         assert_eq!(expected, 40, "the whole prompt ran exactly once");
+    }
+
+    #[test]
+    fn a_prompt_that_is_admitted_gets_a_slice_in_the_pass_that_admitted_it() {
+        // A pool tight enough that the residents' next blocks nearly empty it.
+        // Admitting the newcomer before they took theirs left it in the running
+        // set with no blocks and nothing to run, holding the place of the next
+        // prompt until something evicted it. The counter had already moved, so
+        // the engine believed it had prefilled something.
+        let mut scheduler = scheduler(9, 4, 8);
+        scheduler.set_chunk(Some(64));
+        for id in 1..=4 {
+            scheduler.submit(sequence(id, 4, 30));
+        }
+
+        let mut before = scheduler.metrics().prefills;
+        for pass in 0..60 {
+            let plan = scheduler.plan();
+            let after = scheduler.metrics().prefills;
+            if after > before {
+                let carried: Vec<u64> = match &plan {
+                    Plan::Mixed { advanced, .. } => advanced.iter().map(|&(id, _)| id).collect(),
+                    Plan::Prefill { ids, .. } => ids.clone(),
+                    other => panic!("pass {pass}: admitted on a {other:?}"),
+                };
+                assert!(
+                    !carried.is_empty(),
+                    "pass {pass}: a sequence was admitted and the pass ran nothing for it"
+                );
+            }
+            before = after;
+            let rows = plan.ids().len();
+            scheduler.commit(&plan, &vec![7; rows]);
+        }
+        assert!(
+            scheduler.metrics().prefills >= 4,
+            "nothing was ever admitted: {:?}",
+            scheduler.metrics()
+        );
     }
 }
