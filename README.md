@@ -91,6 +91,8 @@ A test that has never failed is not evidence, so the tests are tested. `scripts/
     rotary halves paired the other way round                               caught     caught
     the MLP gate and up branches swapped                                   caught     caught
 
+Those five are the forward pass's. The full table is 21 mutations across five suites, one per part of the engine, and the shape of the result is the point: no suite catches everything and every mutation is caught by at least one. The forward-pass suites survive every batching defect and the batching suite survives every model defect, because a differential test cannot see a defect that moves both of its sides equally. The table was also run with a suite missing and found three defects nothing was checking, which is how the unit tests came to be in it.
+
 It refuses to start on a working tree with uncommitted changes to the files it rewrites, restores them whether the run passed, failed or crashed, and reports a mutation whose anchor has moved as a failure rather than skipping it, since a mutation that no longer applies is one nothing is checking.
 
 ## Serving the `OpenAI` API
@@ -483,8 +485,8 @@ of logits produced and moved so that nobody could look at them.
 
 Measured on four clients streaming when a prompt of about 810 words arrives.
 What is timed is the gap between one token and the next, for the clients that
-were already running. The median says nothing here, since the stall is one gap
-in a hundred:
+were already running. The median says nothing here, since the stall is a handful
+of gaps among several hundred ordinary ones:
 
 | `--chunk` | median gap | worst gap | gaps over 100 ms | total stalled | newcomer's first token |
 | --- | --- | --- | --- | --- | --- |
@@ -505,8 +507,8 @@ them barely moves. What changes is that no single one of them is a second long.
 
 **Below 64 the fixed cost of a pass takes over.** At a slice of 32 no gap exceeds
 100 ms at all, and the arriving prompt pays 1.7x for its own first token, since
-its prefill is now spread over 35 passes whose overhead it pays each time. That
-is the crossover, and it is the reason the default is a measurement on this
+its prefill is now spread over dozens of passes whose overhead it pays each
+time. That is the crossover, and it is the reason the default is a measurement on this
 machine rather than a constant copied from another engine. 128 buys the 5.1x for
 nothing measurable; 64 buys 9.4x for 13 % of the newcomer's first token, which is
 a trade the flag leaves open.
@@ -521,6 +523,14 @@ whole and in slices of 1, 3, 4, 7 and its full length, and requires the logits t
 agree. Slices that do not line up with the block size are in that list on
 purpose: a boundary landing mid-block is where a position offset goes wrong
 without changing any shape.
+
+That differential test has a blind spot worth naming, because the mutation table
+found it rather than a reading of the code. It builds its own batches, so it
+checks that a correct set of positions produces correct logits and never that
+the scheduler produces a correct set: a slice restarting its positions at zero
+survived every suite in the repository. What catches it is a scheduler test that
+reads the positions out of the batch directly. Twenty-one mutations now, all
+caught, and still no suite catching all of them.
 
 ## Build order
 
