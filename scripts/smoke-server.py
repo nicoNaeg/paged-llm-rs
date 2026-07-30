@@ -212,6 +212,38 @@ def main() -> int:
         )
         check("accepts the defaults a client sends anyway", status == 200)
 
+        # A prompt longer than the pass budget, arriving with nothing else
+        # running, so its first slices go through the model asking for no logits
+        # at all. That is the only shape where a pass produces an empty result,
+        # and it answered 500 until the sampler stopped touching it: casting a
+        # zero-row tensor dispatches a Metal kernel over zero elements and candle
+        # divides by zero working out its grid. No unit test reaches it, because
+        # the committed fixture is f32 and the cast is then a no-op.
+        print("\nprompts longer than one pass, which is where the slicing shows")
+        long_prompt = "Summarise these notes in one sentence. " + (
+            "The allocator hands out fixed size blocks and a table maps a "
+            "sequence position to one of them. " * 40
+        )
+        status, out, _ = call(
+            "/v1/completions", {"prompt": long_prompt, "max_tokens": 8, "temperature": 0}
+        )
+        answered = status == 200 and out.get("choices", [{}])[0].get("text", "") != ""
+        check(
+            "a prompt longer than the pass budget is answered",
+            answered,
+            out.get("error", {}).get("message", "") if status != 200 else
+            f"{out['usage']['prompt_tokens']} prompt tokens",
+        )
+        # Sliced or whole, a greedy request has one answer.
+        status, whole, _ = call(
+            "/v1/completions",
+            {"prompt": long_prompt, "max_tokens": 8, "temperature": 0},
+        )
+        check(
+            "the same long prompt answers the same way twice",
+            status == 200 and answered and whole["choices"][0]["text"] == out["choices"][0]["text"],
+        )
+
         print("\nthroughput, one sequence, contiguous cache")
         print(f"  {'tokens':>7} {'seconds':>8} {'tok/s':>7} {'ms/token':>9}")
         for budget in (16, 64, 128, 256, 512, 1024):

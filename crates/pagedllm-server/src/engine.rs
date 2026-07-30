@@ -260,6 +260,12 @@ fn sample(
     let logits = model
         .forward_batch(batch, cache)
         .map_err(|e| e.to_string())?;
+    // A pass in the middle of a prompt runs only to fill the cache and asks for
+    // no logits. Nothing below may touch the result: it has zero rows, and a
+    // Metal dispatch over zero elements divides by zero inside candle.
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     // One transfer for the whole batch rather than one per row. The vocabulary
     // is 150k logits wide and all of it has to reach the host for a sampler that
     // runs there.

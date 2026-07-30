@@ -268,3 +268,80 @@ fn the_kernel_agrees_with_the_tensor_path_on_the_gpu() {
     println!("kernel against the tensor path on metal: worst {worst_seen:.3e}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A pass that asks for no logits at all, on the GPU.
+///
+/// This is what a slice in the middle of a prompt runs: it goes through the
+/// model only to fill the cache, and produces nothing until its last token has
+/// gone through. What this checks is that the pass runs at all on the GPU and
+/// that the cache it filled is real, by predicting from it afterwards and
+/// comparing against the same prompt run whole.
+///
+/// It does not check what actually broke, and that is worth writing down. The
+/// server answered 500 on the first request whose prompt was longer than the
+/// budget with nothing else running, because casting a zero-row tensor to f32
+/// dispatches a Metal kernel over zero elements and candle divides by zero
+/// working out its grid. This fixture is f32, so the cast is a no-op and the
+/// crash cannot happen here. The rule the engine follows is that nothing may
+/// touch the result of a pass that asked for nothing, and the check that would
+/// have caught its breaking is over HTTP, in `scripts/smoke-server.py`.
+#[cfg(feature = "metal")]
+#[test]
+fn a_pass_that_asks_for_no_logits_runs_on_the_gpu_and_fills_the_cache() {
+    let Ok(device) = Device::new_metal(0) else {
+        eprintln!("skipped: no Metal device");
+        return;
+    };
+    let (_, prompt, tolerance) = load_tiny();
+    let mut model = Model::load(common::fixture_dir(), &device).expect("load on metal");
+    model.set_attention(AttentionKind::Kernel);
+    let block_size = 4;
+
+    let config = model.config();
+    let cache = PagedCache::new(
+        CacheConfig {
+            block_size,
+            blocks: 64,
+            kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            layers: config.num_hidden_layers,
+        },
+        model.dtype(),
+        &device,
+    )
+    .expect("a pool on metal");
+    let mut allocator = BlockAllocator::new(64);
+    let mut table = BlockTable::new(block_size);
+
+    // Every token but the last, asking for nothing.
+    let head = prompt.len() - 1;
+    grow(&mut allocator, &mut table, head);
+    let entries: Vec<(u32, &BlockTable, usize)> =
+        (0..head).map(|at| (prompt[at], &table, at)).collect();
+    let batch = Batch::unfolded(&entries, &[], block_size).expect("a batch with no predictions");
+    let empty = model
+        .forward_batch(&batch, &cache)
+        .expect("a pass asking for nothing still runs");
+    assert_eq!(empty.dim(0).unwrap(), 0, "it produced logits nobody wanted");
+    table.advance(head).unwrap();
+
+    // The last token, which is the one that predicts.
+    grow(&mut allocator, &mut table, 1);
+    let last = [(prompt[head], &table, head)];
+    let batch = Batch::unfolded(&last, &[0], block_size).expect("the predicting batch");
+    let got = model
+        .forward_batch(&batch, &cache)
+        .expect("the last token runs");
+
+    let whole = model.forward(&prompt).expect("the same prompt in one pass");
+    let want = whole
+        .narrow(1, prompt.len() - 1, 1)
+        .unwrap()
+        .reshape((1, ()))
+        .unwrap();
+    let (worst, scale) = compare(&got, &want);
+    assert!(
+        f64::from(worst) <= tolerance,
+        "the cache the silent pass filled is wrong: off by {worst:.3e} on values up to {scale:.3e}"
+    );
+}

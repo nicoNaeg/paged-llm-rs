@@ -392,7 +392,10 @@ impl Scheduler {
         if !self.running.iter().any(|s| s.prompt_left > 0) {
             self.start_next_prompt();
         }
-        let index = self.running.iter().position(|s| s.prompt_left > 0)?;
+        let index = self
+            .running
+            .iter()
+            .position(|s| s.prompt_left > 0 && s.finish.is_none())?;
 
         // Decodes are taken first. They are what a client is watching, and a
         // slice that crowded them out would trade one stall for another.
