@@ -164,37 +164,59 @@ The contiguous cache is not gone, it is a setting. `--block-size 1024` on a
 reservation, and `--block-size 16` is paging. Same pool, same memory, same
 everything else, so the two are one flag apart.
 
-Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 3584 MiB of cache either way, prompts of
-about ten words and 128 tokens each:
+Apple M4 Pro, Metal, Qwen3-0.6B in bf16, 3584 MiB of cache in every column,
+prompts of about ten words and 128 tokens each. The five configurations run back
+to back in one invocation, which matters: absolute throughput on this machine
+drifts between sessions by more than the gaps below, so what is comparable is a
+column against another column of the same run, not against a number published on
+another day.
 
-| clients | reservation | paging | paging and kernel |
-|---------|-------------|--------|-------------------|
-| 1 | 51.4 tok/s | 48.0 | 58.2 |
-| 4 | 64.0 | 91.9 | 124.9 |
-| 16 | 68.4 | 131.4 | 253.8 |
-| 32 | 69.6 | 149.7 | 367.7 |
-| 64 | 68.3 | 152.6 | **447.9** |
-| ttft at 64 | **30 187 ms** | 1079 ms | 983 ms |
-| p95 at 64 | 119.80 s | 53.67 s | **18.26 s** |
+| clients | reservation | paging | paging and kernel | paging, sliced | paging and kernel, sliced |
+|---------|-------------|--------|-------------------|----------------|---------------------------|
+| 1 | 46.0 tok/s | 64.2 | 73.4 | 63.9 | 73.6 |
+| 4 | 61.9 | 110.2 | 161.0 | 108.6 | 162.0 |
+| 16 | 65.3 | 157.6 | 352.5 | 150.8 | 354.4 |
+| 32 | 62.8 | 181.8 | 557.3 | 157.9 | 542.6 |
+| 64 | 63.3 | 188.2 | **779.8** | 142.5 | 714.3 |
+| ttft at 64 | **33 162 ms** | 872 ms | 854 ms | 2866 ms | 1429 ms |
+| p95 at 64 | 129.44 s | 43.53 s | **10.50 s** | 57.32 s | 11.37 s |
 
-Three things in that table, and the last one is the point.
+The first three columns are the layouts, one flag apart from each other. The last
+two repeat the paged ones with prompts sliced across passes instead of run whole.
 
 The two gains are separate, and separating them is why the block allocator was
 wired into the serving path at stage 4 rather than kept as pure logic until the
-kernel arrived. Paging alone buys 2.2 times the throughput; the kernel on top of
-paging buys 2.9 times again. Neither number is carrying the other's weight, and a
-single 6.6 would have hidden which half came from where.
+kernel arrived. Paging alone buys 3.0 times the throughput at sixty-four clients;
+the kernel on top of paging buys 4.1 times again. Neither number is carrying the
+other's weight, and a single 12.3 would have hidden which half came from where.
 
 Scaling says the same thing another way. From one client to sixty-four, the
-reservation gains 1.4 times, paging 3.2, and the kernel 7.7. A serving engine
+reservation gains 1.4 times, paging 2.9, and the kernel 10.6. A serving engine
 that does not scale with concurrency is not serving, it is queueing.
 
 And the row that says why paging exists. At 3584 MiB a reservation of 1024
 tokens buys thirty-two of them, so the thirty-third client waits for someone to
-finish: thirty seconds before its first token, against 976 milliseconds. The same
-memory in blocks of sixteen holds 32 768 tokens, which is 237 sequences of the
-length these requests actually reach. The ceiling moved by a factor of seven, and
-nothing about the model or the kernel changed to move it.
+finish: thirty-three seconds before its first token, against 854 milliseconds.
+The same memory in blocks of sixteen holds 32 768 tokens, which is 237 sequences
+of the length these requests actually reach. The ceiling moved by a factor of
+seven, and nothing about the model or the kernel changed to move it.
+
+**What the last two columns cost is the finding that goes against stage 8.** On
+this workload nothing needs slicing: the prompts are ten words, far inside any
+budget. What slicing changes anyway is the shape of a pass, because an admitted
+prompt now rides with the decodes as one row per token instead of one row of
+many, and a row is what the gather copies. The tensor path pays 24 % for that,
+188.2 down to 142.5, and the kernel pays 8 %, 779.8 down to 714.3, because it
+reads the blocks where they are and never builds the rectangle. The difference
+between those two numbers is the gather, measured rather than argued.
+
+Time to first token pays more than throughput does: 854 ms to 1429 at sixty-four
+clients on the kernel path. That one is not the gather, it is the admission
+policy. One prompt joins per pass either way, and a pass carrying a slice costs
+more than a prefill of ten words, so sixty-four clients arriving together queue
+for longer. vLLM admits several partial prefills into the same mixed batch, which
+is what would close it; this engine admits one, and the flag is there for a
+workload that would rather not pay.
 
 ### What paging costs, and what it happens to save
 
