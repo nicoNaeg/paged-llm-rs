@@ -1,9 +1,10 @@
-.PHONY: build server test test-metal test-model smoke bench-concurrency mutate bench lint fmt venv model fixtures reference
+.PHONY: build server test test-metal test-model smoke bench-concurrency bench-engines profile mutate bench lint fmt venv model model-gguf fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
 PYTHON    ?= $(CURDIR)/.venv/bin/python
 HF        ?= https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main
+GGUF      ?= https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-BF16.gguf
 
 build:
 	cargo build --release --features metal
@@ -33,6 +34,15 @@ test-model:
 # prints the throughput of one sequence against the contiguous cache.
 smoke: build
 	python3 scripts/smoke-server.py
+
+# This engine against the others on this machine, driven by guidellm.
+bench-engines: build
+	$(PYTHON) scripts/bench-engines.py
+
+# A Metal System Trace of a decode under load, written to docs/. Needs a full
+# Xcode, which nothing else here does.
+profile: build
+	$(PYTHON) scripts/profile-gpu.py
 
 # What continuous batching buys against what the reservation costs.
 bench-concurrency: build
@@ -68,7 +78,7 @@ fmt:
 venv:
 	python3 -m venv .venv
 	$(PYTHON) -m pip install --quiet --upgrade pip
-	$(PYTHON) -m pip install --quiet torch transformers
+	$(PYTHON) -m pip install --quiet torch transformers guidellm
 
 model:
 	mkdir -p $(MODEL)
@@ -78,6 +88,12 @@ model:
 
 # Regenerates the fixture that is committed, so a change to the oracle is a
 # change to the repository rather than to one machine.
+# The same weights in the format llama.cpp reads, for the comparison to be of
+# one model rather than of two.
+model-gguf:
+	mkdir -p $(CURDIR)/models/gguf
+	curl -fsSL -o $(CURDIR)/models/gguf/Qwen3-0.6B-BF16.gguf $(GGUF)
+
 fixtures:
 	$(PYTHON) scripts/dump_reference.py tiny crates/pagedllm/tests/fixtures/tiny
 

@@ -1,0 +1,24 @@
+Metal System Trace, 10s of 16 concurrent requests,
+Apple M4 Pro, Qwen3-0.6B in bf16, blocks of 16, the hand-written kernel.
+
+  encoders                     8813
+  command buffers              11230
+  encoders a second            881
+  command buffers a second     1123
+  output tokens a second       115
+  decode steps a second        7.2
+  a decode step                139.0 ms
+  encoders a step              122
+  command buffers a step       156
+
+A decode step reads 1.50 GB of weights whatever the batch,
+which at 273 GB/s of unified memory is a floor of 5.5 ms a step.
+The step is split into 156 command buffer submissions, about five a layer,
+and each is a round trip the floor above does not account for.
+
+The rates here are depressed by the recording itself and are not the
+engine's speed; `make bench-engines` measures that untraced. What the
+recording is for is the count per step, which a slowdown does not move.
+
+Reproduced by `make profile`. The trace itself is not committed: eight
+seconds of it is a hundred megabytes.

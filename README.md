@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 5 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own.
+**Status: stage 6 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
 
 ## Design
 
@@ -290,6 +290,118 @@ Encoding into candle's command buffer rather than a private one is also what
 makes the ordering correct without a barrier written by hand: candle tracks which
 buffers a kernel wrote and inserts the barrier before the next one reads them.
 
+## Against the other engines, same machine, same client
+
+    make bench-engines
+
+`guidellm` sends the load and reads the results. A number produced by a harness
+written here would be a number about this repository; guidellm is standalone,
+speaks the `OpenAI` API, and is what people already point at other servers, so
+all three engines are driven by the same client with the same flags.
+
+Held equal: Qwen3-0.6B in bfloat16 everywhere, llama.cpp on the BF16 GGUF
+conversion of this same checkpoint rather than a quantised one; the same context;
+the same KV cache budget where the engine exposes one; prompts of exactly 128
+tokens and exactly 128 tokens asked for, with no spread. What is not held equal
+is the sampler, because each engine's arithmetic picks its own tokens, which
+changes nothing about a rate.
+
+Apple M4 Pro, macOS 26.5, llama.cpp b10180, mistral.rs 0.9.0.
+
+**Output tokens a second**
+
+| clients | paged-llm-rs | llama.cpp | mistral.rs |
+|---------|--------------|-----------|------------|
+| 1 | 80.7 | **139.3** | 129.8 |
+| 4 | 175.3 | **389.3** | 222.8 |
+| 16 | 327.7 | **621.2** | 565.3 |
+| 32 | 478.5 | **686.2** | 342.0 |
+| 64 | 644.3 | **771.4** | 26.8 (see below) |
+
+**Time to first token, median**
+
+| clients | paged-llm-rs | llama.cpp | mistral.rs |
+|---------|--------------|-----------|------------|
+| 1 | **25 ms** | 61 ms | 28 ms |
+| 16 | **114 ms** | 616 ms | 190 ms |
+| 32 | **242 ms** | 1263 ms | 675 ms |
+| 64 | **500 ms** | 2092 ms | 786 ms |
+
+Read honestly, that says three things.
+
+**llama.cpp is faster on throughput at every level, and this engine does not
+catch it.** Its Metal kernels have been hand-tuned for years and this one is a
+few hundred lines old. The gap does narrow as concurrency rises, from 1.7 times
+at one client to 1.2 at sixty-four, which says the scheduler is doing its job
+while the kernels are not yet doing theirs.
+
+**This engine answers first, by a widening margin.** At sixty-four clients
+llama.cpp takes two seconds to produce a first token and this one takes half a
+second. That is a design choice showing up in a measurement rather than a
+surprise: admission runs before decoding, so a request that arrives starts on the
+next pass instead of waiting for a batch to turn over. It is the same choice that
+costs throughput, because a pass spent on a prompt is a pass not spent on tokens.
+
+**mistral.rs collapses past sixteen clients**, from 565 tokens a second to 342
+and then to 26.8, with a p95 of 33 seconds. It is the closest of the three at low
+load and the only one that does not survive the climb.
+
+Two things about its column are worth saying plainly, because both weaken it and
+both were found by checking the run rather than reading the table. Its
+sixty-four-client figure rests on six requests that finished out of sixty-nine,
+where the other two finished a hundred and nine and a hundred and one at the same
+level, so the collapse is certain and the number is thin. And it produced 115 to
+124 tokens a request where the other two produced exactly the 128 asked for,
+which is a tenth less work delivered per request. A rate is still a rate, but the
+engines were not given the same thing to finish.
+
+### The comparison that is missing, and why
+
+The interesting comparison here was two paged attention implementations on the
+same GPU. It is not in the table because mistral.rs's does not run: with
+`--paged-attn on` it serves four concurrent requests and stops answering at
+sixteen, connections accepted and never served, the process at 0 % CPU. The same
+sixteen requests with `--paged-attn off` complete in 25 seconds. So its numbers
+above are taken at its working setting, and a reader who sees it lose should know
+it was not running the configuration this project wanted to be measured against.
+
+That was isolated rather than assumed: one request answers, sixteen concurrent
+streaming requests answer, a bounded four-stream benchmark completes in 30
+seconds, and sixteen hangs. The flag is the difference.
+
+It also cost the shape of this benchmark. guidellm's `sweep` profile calibrates
+its own concurrency range and is the better instrument; its last phase sends
+without bound, and mistral.rs stops answering under it. A fixed grid every engine
+survives is worth more than a shape one of them cannot be measured at.
+
+## Where a decode step's time goes
+
+    make profile
+
+A Metal System Trace of the server under sixteen concurrent requests, summarised
+into `docs/decode-profile.txt`. The trace itself is not committed: eight seconds
+of it is a hundred megabytes, which is the line between an artifact worth
+committing and one worth reproducing.
+
+A decode step reads all 1.50 GB of weights whatever the batch, so unified memory
+at 273 GB/s puts a floor of 5.5 ms under it however fast the arithmetic gets.
+What the trace adds is what the step is made of: **about 150 command buffer
+submissions, roughly five per layer**, each a round trip that the floor does not
+account for.
+
+That is the shape of the remaining gap, and it is not in the attention any more.
+Stage 5 removed the copy that made batching pointless; what is left is the
+granularity at which candle hands work to the GPU, which no kernel written here
+can change. Fusing a layer's projections into fewer dispatches is the next thing
+a measurement would ask for, and it is a change to how the model calls candle
+rather than to the kernel.
+
+One caveat the summary states rather than hides: recording slows the process it
+records, so the tokens a second inside the trace are well under what the same
+load reaches untraced, and the millisecond figure for a step is inflated with
+them. The submissions per step are not, because both rates fall together and
+their ratio survives, and that ratio is what the profile is for.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -299,7 +411,7 @@ Each stage lands with its tests before the next one starts.
 3. **Continuous batching, contiguous cache** (built): the queue, the scheduler and the step loop, against a pool of pre-allocated slots, one reserved buffer per resident sequence. This is the baseline the paged version has to beat, and it is measured before it is replaced.
 4. **Block allocator** (built): the paged layout as pure logic, no GPU involved, allocation, release and block tables, fully unit tested, and wired into the serving path so the memory it buys is measured before the kernel arrives.
 5. **Paged attention kernel** (built): the Metal kernel that reads keys and values through a block table on a decode step, compiled from source at startup, checked against a scalar reference and against the tensor path it replaces.
-6. **Benchmarks and profiling** (planned): against `llama-server` and `mistral.rs` on the same machine with the same model, plus a GPU profile of the kernel. The delta between stages 3 and 5 is the headline result.
+6. **Benchmarks and profiling** (built): against `llama-server` and `mistral.rs` on this machine with the same model, driven by `guidellm`, plus a Metal System Trace of a decode step.
 7. **Prefix caching** (planned): a radix tree over block hashes, so requests sharing a system prompt share physical blocks instead of recomputing them.
 8. **Chunked prefill** (planned): a long prompt processed a slice per step, so an arriving request stops adding a latency spike to every sequence already decoding.
 
@@ -320,7 +432,8 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
     crates/pagedllm/src/kernels/  the Metal kernel and the scalar reference beside it
     crates/pagedllm/tests/      the comparisons against the reference, and their fixtures
     crates/pagedllm-server/     OpenAI-compatible HTTP server on axum
-    scripts/                    the reference dumps, the mutation run, the smoke test
+    scripts/                    the reference dumps, the mutation run, the benchmarks
+    docs/                       the profile summary the README cites
     Makefile                    build, test and lint entry points
 
 ## Development
@@ -334,12 +447,14 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make test-metal  adds the tests that need a Metal device, the kernel among them
     make smoke       drive the server over HTTP and print its throughput
     make bench-concurrency   what batching buys and what the reservation costs
+    make bench-engines       against llama.cpp and mistral.rs, driven by guidellm
+    make profile             a Metal System Trace of a decode step
     make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets
 
 The full-scale comparison needs three things the repository does not carry, in this order:
 
-    make venv        a virtualenv with torch and transformers, for the oracle
+    make venv        a virtualenv with torch, transformers and guidellm
     make model       Qwen3-0.6B from HuggingFace, 1.5 GB
     make reference   the reference activations, dumped in f32 and in bf16
     make test-model  the comparison itself
