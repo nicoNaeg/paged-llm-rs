@@ -512,28 +512,29 @@ of gaps among several hundred ordinary ones:
 
 | `--chunk` | median gap | worst gap | gaps over 100 ms | total stalled | newcomer's first token |
 | --- | --- | --- | --- | --- | --- |
-| off | 30.3 ms | 1349 ms | 5 | 5517 ms | 1305 ms |
-| 512 | 30.2 ms | 680 ms | 8 | 4899 ms | 1237 ms |
-| **128** | 30.4 ms | **263 ms** | 24 | 4717 ms | 1293 ms |
-| 64 | 30.4 ms | 144 ms | 28 | 3496 ms | 1523 ms |
-| 32 | 30.8 ms | 94 ms | 0 | 0 ms | 2241 ms |
+| off | 25.5 ms | 1087 ms | 5 | 4448 ms | 1046 ms |
+| 512 | 25.5 ms | 553 ms | 8 | 4015 ms | 1021 ms |
+| **128** | 25.8 ms | **220 ms** | 24 | 3973 ms | 1089 ms |
+| 64 | 26.0 ms | 125 ms | 20 | 2289 ms | 1311 ms |
+| 32 | 26.2 ms | 82 ms | 0 | 0 ms | 1931 ms |
 
 M4 Pro, Metal, Qwen3-0.6B bf16, blocks of 16, prefix cache off so the prompt is
 really computed.
 
-**The worst gap falls by 5.1 at the default and the work does not go anywhere.**
+**The worst gap falls by 4.9 at the default and the work does not go anywhere.**
 That is the honest reading of the table and it is why the last three columns are
 in it. Slicing a prefill does not make it cheaper, it spreads it: the number of
 gaps a client would notice as a pause goes from 5 to 24, while the time spent in
-them barely moves. What changes is that no single one of them is a second long.
+them moves by a tenth. What changes is that no single one of them is a second
+long.
 
 **Below 64 the fixed cost of a pass takes over.** At a slice of 32 no gap exceeds
-100 ms at all, and the arriving prompt pays 1.7x for its own first token, since
+100 ms at all, and the arriving prompt pays 1.85x for its own first token, since
 its prefill is now spread over dozens of passes whose overhead it pays each
-time. That is the crossover, and it is the reason the default is a measurement on this
-machine rather than a constant copied from another engine. 128 buys the 5.1x for
-nothing measurable; 64 buys 9.4x for 13 % of the newcomer's first token, which is
-a trade the flag leaves open.
+time. That is the crossover, and it is the reason the default is a measurement
+on this machine rather than a constant copied from another engine. 128 buys the 4.9x for
+4 % of the newcomer's first token; 64 buys 8.7x for 25 %, which is a trade the flag
+leaves open.
 
 The scheduler tests cover the policy without a model: that a prompt is fed a
 slice at a time and no pass exceeds its budget, that residents keep producing a
