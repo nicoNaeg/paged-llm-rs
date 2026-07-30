@@ -37,10 +37,19 @@ TOKENS = 128
 CONCURRENCY = (1, 4, 16, 32, 64)
 # A block as wide as the context is one block a sequence, which is a
 # reservation; sixteen is paging. Same memory, same everything else.
+#
+# The last two repeat the paged layouts with prompts sliced across passes rather
+# than run whole. That is not a separate feature being measured here, it is the
+# one thing that changes what a batch looks like: a slice is unfolded into one
+# row per token, and a row is what the gather copies. The two attention paths
+# should therefore answer it differently, and the point of running all five is
+# that the difference is measured rather than argued.
 LAYOUTS = (
-    (1024, "tensor", "a reservation, gathered by the tensor path"),
-    (16, "tensor", "paging, gathered by the tensor path"),
-    (16, "kernel", "paging, read in place by the kernel"),
+    (1024, "tensor", "off", "a reservation, gathered by the tensor path, prompts whole"),
+    (16, "tensor", "off", "paging, gathered by the tensor path, prompts whole"),
+    (16, "kernel", "off", "paging, read in place by the kernel, prompts whole"),
+    (16, "tensor", "128", "paging, gathered by the tensor path, prompts sliced"),
+    (16, "kernel", "128", "paging, read in place by the kernel, prompts sliced"),
 )
 
 
@@ -92,12 +101,12 @@ def main() -> int:
     if not MODEL.exists():
         raise SystemExit(f"{MODEL} is missing; run `make model` first")
 
-    for block_size, attention, label in LAYOUTS:
-        run_layout(block_size, attention, label)
+    for block_size, attention, chunk, label in LAYOUTS:
+        run_layout(block_size, attention, chunk, label)
     return 0
 
 
-def run_layout(block_size: int, attention: str, label: str) -> None:
+def run_layout(block_size: int, attention: str, chunk: str, label: str) -> None:
     process = subprocess.Popen(
         [
             str(BINARY),
@@ -107,6 +116,7 @@ def run_layout(block_size: int, attention: str, label: str) -> None:
             "--cache-mib", str(CACHE_MIB),
             "--attention", attention,
             "--max-batch", "64",
+            "--chunk", chunk,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
