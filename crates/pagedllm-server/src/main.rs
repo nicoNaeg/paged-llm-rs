@@ -60,6 +60,12 @@ struct Args {
     /// turns it off so the two can be compared by a flag.
     #[arg(long, default_value = "on")]
     prefix_cache: String,
+    /// Most tokens one forward pass may carry, a waiting prompt's slice and
+    /// every running sequence's next token together. `off` runs a prompt whole,
+    /// which is the prefill-first policy stage 3 built and which freezes every
+    /// sequence already generating for the length of that prefill.
+    #[arg(long, default_value = "128")]
+    chunk: String,
 }
 
 #[tokio::main]
@@ -98,12 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("--prefix-cache {other:?}, which is neither on nor off").into());
         }
     };
+    let chunk = match args.chunk.as_str() {
+        "off" => None,
+        other => Some(other.parse::<usize>().map_err(|_| {
+            format!("--chunk {other:?}, which is neither a token count nor \"off\"")
+        })?),
+    };
+    if chunk == Some(0) {
+        return Err("--chunk 0 would carry nothing".into());
+    }
     let pool = PoolConfig {
         block_size: args.block_size,
         blocks: per_token.blocks_within(budget, dtype_for_pool),
         max_batch: args.max_batch,
         attention,
         prefix_cache,
+        chunk,
     };
     let engine = Engine::start(args.model.clone(), device.clone(), dtype, pool)
         .await
@@ -115,8 +131,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("pagedllm-server {}", env!("CARGO_PKG_VERSION"));
     println!("  model    {}", args.model.display());
     println!(
-        "  backend  {backend}, attention {attention}, prefix cache {}",
-        if prefix_cache { "on" } else { "off" }
+        "  backend  {backend}, attention {attention}, prefix cache {}, chunk {}",
+        if prefix_cache { "on" } else { "off" },
+        match chunk {
+            Some(tokens) => tokens.to_string(),
+            None => "off".to_string(),
+        }
     );
     println!(
         "  sampling temperature {:?}, top_p {:?}, top_k {:?}, from the model's generation config",

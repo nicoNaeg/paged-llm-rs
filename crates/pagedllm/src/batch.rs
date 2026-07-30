@@ -59,10 +59,10 @@ impl CacheConfig {
 
 /// One forward pass's worth of work.
 ///
-/// Every row carries the same number of tokens, which is what makes a batch a
-/// rectangle. Decoding is many rows of one token; a prefill is one row of many.
-/// Mixing them in a single pass is what stage 8 adds, and its absence is why a
-/// long prompt arriving today stalls every sequence already decoding.
+/// A rectangle carries the same number of tokens on every row: decoding is many
+/// rows of one token, a prefill is one row of many. `unfolded` builds the other
+/// shape, one row per token, which is what lets a slice of somebody's prompt
+/// ride in the same pass as everybody else's next token.
 #[derive(Debug, Clone)]
 pub struct Batch {
     /// Token ids, row-major, `rows * seq` of them.
@@ -82,6 +82,15 @@ pub struct Batch {
     pub rows: usize,
     /// How many tokens per row.
     pub seq: usize,
+    /// Which of the `rows * seq` positions the model should project to logits,
+    /// flattened row-major.
+    ///
+    /// Not every token needs them, and computing the ones nobody reads is the
+    /// most expensive way to waste a pass: the vocabulary is 151 936 wide, so a
+    /// 512-token chunk projected in full would be 311 MB of logits to produce
+    /// and to move, for one row anybody looks at. A chunk that is not the last
+    /// of its prompt asks for none at all.
+    pub logit_rows: Vec<u32>,
 }
 
 impl Batch {
@@ -134,6 +143,11 @@ impl Batch {
             }
         }
 
+        // A rectangle predicts from the last token of every row.
+        let logit_rows = (0..rows)
+            .map(|row| u32::try_from(row * seq + seq - 1).expect("a batch fits in u32"))
+            .collect();
+
         Ok(Self {
             tokens,
             write_slots,
@@ -142,6 +156,77 @@ impl Batch {
             starts,
             rows,
             seq,
+            logit_rows,
+        })
+    }
+
+    /// Build a pass out of individual tokens rather than out of equal rows.
+    ///
+    /// This is what lets one pass carry a slice of somebody's prompt next to
+    /// everybody else's next token. A rectangle cannot: its rows all have the
+    /// same length, and a 512-token chunk beside sixteen one-token decodes is
+    /// not one. Unfolded, a row is a token, `seq` is one, and the mask and the
+    /// kernel need no change at all, because both already take a position and a
+    /// block table per row.
+    ///
+    /// `entries` is one `(token, table, position)` per token, and `predicts`
+    /// marks the entries whose logits are wanted: the last token of a decode,
+    /// and the last token of a prompt's final chunk. A chunk in the middle of a
+    /// prompt asks for nothing.
+    ///
+    /// # Panics
+    ///
+    /// If a slot index does not fit in a `u32`, which needs a pool of four
+    /// billion blocks.
+    pub fn unfolded(
+        entries: &[(u32, &BlockTable, usize)],
+        predicts: &[usize],
+        block_size: usize,
+    ) -> Result<Self> {
+        if entries.is_empty() {
+            return Err(Error::Config("an empty batch".into()));
+        }
+        let rows = entries.len();
+        let longest = entries
+            .iter()
+            .map(|&(_, _, position)| position + 1)
+            .max()
+            .unwrap_or(0);
+        let blocks_per_row = longest.div_ceil(block_size);
+
+        let mut tokens = Vec::with_capacity(rows);
+        let mut write_slots = Vec::with_capacity(rows);
+        let mut starts = Vec::with_capacity(rows);
+        let mut read_blocks = Vec::with_capacity(rows * blocks_per_row);
+        for &(token, table, position) in entries {
+            let slot = table
+                .slot_of(position)
+                .ok_or_else(|| Error::Config(format!("no block for position {position}")))?;
+            tokens.push(token);
+            write_slots.push(u32::try_from(slot).expect("a pool fits in u32"));
+            starts.push(position);
+            // Padded with the row's own first block, for the same reason the
+            // rectangle is: a mask that leaked would read this sequence's own
+            // history rather than a stranger's.
+            let blocks = table.blocks();
+            let filler = *blocks.first().unwrap_or(&0);
+            for index in 0..blocks_per_row {
+                read_blocks.push(blocks.get(index).copied().unwrap_or(filler));
+            }
+        }
+
+        Ok(Self {
+            tokens,
+            write_slots,
+            read_blocks,
+            blocks_per_row,
+            starts,
+            rows,
+            seq: 1,
+            logit_rows: predicts
+                .iter()
+                .map(|&row| u32::try_from(row).expect("a batch fits in u32"))
+                .collect(),
         })
     }
 

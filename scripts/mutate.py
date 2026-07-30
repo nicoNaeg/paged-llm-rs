@@ -46,6 +46,7 @@ BATCH = ROOT / "crates/pagedllm/src/batch.rs"
 KERNEL = ROOT / "crates/pagedllm/src/kernels/paged_attention.rs"
 BLOCKS = ROOT / "crates/pagedllm/src/blocks.rs"
 MSL = ROOT / "crates/pagedllm/src/kernels/paged_attention.metal"
+SCHEDULER = ROOT / "crates/pagedllm/src/scheduler.rs"
 
 # (what the mistake is, file, the code as written, the code with the defect)
 MUTATIONS = [
@@ -156,6 +157,32 @@ MUTATIONS = [
         KERNEL,
         "            .map(|start| u32::try_from(start + 1).unwrap_or(u32::MAX))",
         "            .map(|start| u32::try_from((*start).max(1)).unwrap_or(u32::MAX))",
+    ),
+    (
+        "a prompt slice in the middle asked for logits it should not produce",
+        SCHEDULER,
+        """        let last_slice = take == sequence.prompt_left;
+        if last_slice {""",
+        """        let last_slice = take == sequence.prompt_left;
+        if true {""",
+    ),
+    (
+        "a prompt slice booked as one token however many it carried",
+        SCHEDULER,
+        "        advanced.push((sequence.id, take));",
+        "        advanced.push((sequence.id, 1));",
+    ),
+    (
+        "a slice given the whole budget rather than what the decodes left",
+        SCHEDULER,
+        "        let room = budget.saturating_sub(decodes);",
+        "        let room = budget;",
+    ),
+    (
+        "a slice's tokens positioned from the start of the prompt each time",
+        SCHEDULER,
+        "            rows.push((index, done + offset));",
+        "            rows.push((index, offset));",
     ),
 ]
 

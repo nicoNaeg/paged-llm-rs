@@ -5,12 +5,14 @@
 //! batch, and takes back the tokens that came out. That split is what makes the
 //! policy testable at a hundred sequences a millisecond, without a model.
 //!
-//! The policy is prefill-first, the one vLLM shipped before chunked prefill: a
-//! step that can admit a waiting sequence runs its whole prompt and nothing
-//! else. It is not the best policy and is not meant to be. A long prompt stalls
-//! every sequence already decoding for the length of its prefill, and that stall
-//! is what stage 8 exists to remove, which is easier to demonstrate having first
-//! been built.
+//! Two policies live here and a flag picks between them. Prefill-first is the
+//! one vLLM shipped before chunked prefill: a step that can admit a waiting
+//! sequence runs its whole prompt and nothing else, so a long prompt stalls
+//! every sequence already decoding for the length of its prefill. Chunked
+//! prefill cuts that prompt into slices and puts one slice in each pass beside
+//! everybody's next token, which turns one long stop into several short ones
+//! without removing the work. Both stay reachable, because the comparison
+//! between them is the measurement.
 //!
 //! When the pool runs dry mid-generation a sequence is evicted rather than made
 //! to wait. Waiting would deadlock: if every resident sequence needs a block and
@@ -47,6 +49,9 @@ pub struct Sequence {
     pending: Vec<u32>,
     generated: usize,
     preemptions: u32,
+    /// How many prompt tokens still have to pass through the model. Non-zero
+    /// only while a prompt is being run a slice at a time.
+    prompt_left: usize,
     finish: Option<Finish>,
 }
 
@@ -75,6 +80,7 @@ impl Sequence {
             table: BlockTable::new(1),
             generated: 0,
             preemptions: 0,
+            prompt_left: 0,
             finish: None,
         })
     }
@@ -117,6 +123,22 @@ pub enum Plan {
         /// What to run.
         batch: Batch,
     },
+    /// One pass carrying a slice of one prompt next to the token every running
+    /// sequence is producing.
+    ///
+    /// `advanced` says how many tokens each sequence wrote, because an unfolded
+    /// pass gives different sequences different numbers of rows and the
+    /// bookkeeping cannot be read back off the batch. `ids` are the sequences a
+    /// token comes back for; a prompt still in the middle of its slices is not
+    /// among them, because it produces nothing until its last token has run.
+    Mixed {
+        /// The sequences a token comes back for, in row order.
+        ids: Vec<u64>,
+        /// What each sequence wrote, as (id, tokens).
+        advanced: Vec<(u64, usize)>,
+        /// What to run.
+        batch: Batch,
+    },
     /// One token for each sequence able to take one.
     Decode {
         /// The sequences, in row order.
@@ -137,7 +159,22 @@ impl Plan {
     pub fn ids(&self) -> &[u64] {
         match self {
             Self::Idle | Self::Refused { .. } => &[],
-            Self::Prefill { ids, .. } | Self::Decode { ids, .. } => ids,
+            Self::Prefill { ids, .. } | Self::Decode { ids, .. } | Self::Mixed { ids, .. } => ids,
+        }
+    }
+
+    /// How many tokens each sequence wrote, as (id, tokens).
+    ///
+    /// A folded pass gives every row the same width, so the batch answers for
+    /// all of them. An unfolded one gives different sequences different numbers
+    /// of rows, so it has to carry the answer.
+    fn advanced(&self) -> Vec<(u64, usize)> {
+        match self {
+            Self::Mixed { advanced, .. } => advanced.clone(),
+            _ => match self.batch() {
+                Some(batch) => self.ids().iter().map(|&id| (id, batch.seq)).collect(),
+                None => Vec::new(),
+            },
         }
     }
 
@@ -145,7 +182,9 @@ impl Plan {
     pub fn batch(&self) -> Option<&Batch> {
         match self {
             Self::Idle | Self::Refused { .. } => None,
-            Self::Prefill { batch, .. } | Self::Decode { batch, .. } => Some(batch),
+            Self::Prefill { batch, .. }
+            | Self::Decode { batch, .. }
+            | Self::Mixed { batch, .. } => Some(batch),
         }
     }
 }
@@ -175,6 +214,12 @@ pub struct Metrics {
     pub admission_stalls: u64,
     /// Sequences evicted to free blocks for another.
     pub preemptions: u64,
+    /// Passes that carried a prompt slice next to the tokens being decoded.
+    pub mixed_steps: u64,
+    /// Passes that carried at least one decode row. Counted rather than
+    /// subtracted, because a mixed pass is a prefill and a decode at once and no
+    /// arithmetic on the other counters recovers it.
+    pub decode_steps: u64,
     /// Tokens re-run because their sequence was evicted, which is what
     /// preemption costs and what a benchmark should report next to its gain.
     pub recomputed_tokens: u64,
@@ -197,11 +242,10 @@ impl Metrics {
 
     /// Average rows per decode pass, which is what continuous batching buys.
     pub fn mean_batch(&self) -> f64 {
-        let decodes = self.steps - self.prefills;
-        if decodes == 0 {
+        if self.decode_steps == 0 {
             return 0.0;
         }
-        self.decode_rows as f64 / decodes as f64
+        self.decode_rows as f64 / self.decode_steps as f64
     }
 }
 
@@ -215,6 +259,9 @@ pub struct Scheduler {
     max_batch: usize,
     /// Whether a sequence may start from blocks another one left behind.
     prefix_cache: bool,
+    /// Most tokens one pass may carry. `None` runs a whole prompt at once,
+    /// which is what stalls everything already decoding.
+    chunk: Option<usize>,
     metrics: Metrics,
 }
 
@@ -230,8 +277,26 @@ impl Scheduler {
             block_size: block_size.max(1),
             max_batch: max_batch.max(1),
             prefix_cache: true,
+            chunk: Some(128),
             metrics: Metrics::default(),
         }
+    }
+
+    /// Most tokens one pass may carry, prompt slices and decodes together.
+    ///
+    /// On by default at 128, which is where `make bench-chunk` puts the knee on
+    /// this machine: it cuts the worst gap between two tokens by five against
+    /// running a prompt whole, and costs the arriving prompt nothing measurable.
+    /// Below 64 the fixed cost of a pass starts to dominate and the newcomer's
+    /// first token gets slower for no further gain. `None` turns it off, which
+    /// is what every stage before this one did.
+    pub fn set_chunk(&mut self, tokens: Option<usize>) {
+        self.chunk = tokens.map(|t| t.max(1));
+    }
+
+    /// The pass budget, when there is one.
+    pub fn chunk(&self) -> Option<usize> {
+        self.chunk
     }
 
     /// Whether a sequence may start from blocks another one left behind.
@@ -294,11 +359,156 @@ impl Scheduler {
     }
 
     /// Decide the next pass.
+    ///
+    /// With a budget set, a slice of the waiting prompt rides in the same pass
+    /// as everybody else's next token, so a long prompt costs the sequences
+    /// already running one longer step rather than a full stop. Without one, a
+    /// prompt takes the whole pass, which is what every stage before this did
+    /// and what the comparison measures against.
     pub fn plan(&mut self) -> Plan {
+        // Refused before anything else, because no arrangement of passes makes a
+        // prompt fit in a pool too small to hold it.
+        if let Some(plan) = self.refuse_unservable() {
+            return plan;
+        }
+        if self.chunk.is_some() {
+            return self.mixed().unwrap_or_else(|| self.decode());
+        }
         if let Some(plan) = self.admit() {
             return plan;
         }
         self.decode()
+    }
+
+    /// One pass carrying a slice of a prompt and every running sequence's next
+    /// token.
+    ///
+    /// `None` when there is no prompt to advance, which leaves the ordinary
+    /// decode to run.
+    fn mixed(&mut self) -> Option<Plan> {
+        let budget = self.chunk?;
+        // A prompt part-way through its slices finishes before a new one starts,
+        // so no prompt is left half-run while another begins.
+        if !self.running.iter().any(|s| s.prompt_left > 0) {
+            self.start_next_prompt();
+        }
+        let index = self.running.iter().position(|s| s.prompt_left > 0)?;
+
+        // Decodes are taken first. They are what a client is watching, and a
+        // slice that crowded them out would trade one stall for another.
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        let mut ids = Vec::new();
+        let mut predicts = Vec::new();
+        let mut advanced: Vec<(u64, usize)> = Vec::new();
+        let cap = self.max_batch.min(budget);
+        for row in 0..self.running.len() {
+            if rows.len() >= cap {
+                break;
+            }
+            let sequence = &self.running[row];
+            if row == index || sequence.finish.is_some() || sequence.pending.len() != 1 {
+                continue;
+            }
+            if sequence.table.blocks_needed(1) > 0 {
+                let Some(block) = self.pool.allocate() else {
+                    // A resident needing a block from a dry pool is a
+                    // preemption, and choosing the victim is the ordinary
+                    // decode's job. Give the whole pass up rather than quietly
+                    // running without this sequence, which would starve it for
+                    // as long as the prompt takes.
+                    return None;
+                };
+                self.running[row].table.push(block);
+            }
+            let sequence = &self.running[row];
+            predicts.push(rows.len());
+            ids.push(sequence.id);
+            advanced.push((sequence.id, 1));
+            rows.push((row, sequence.table.tokens()));
+        }
+        let decodes = rows.len();
+
+        // Whatever the decodes left goes to the prompt.
+        let room = budget.saturating_sub(decodes);
+        if room == 0 {
+            return None;
+        }
+        let done = {
+            let s = &self.running[index];
+            s.history.len() - s.prompt_left
+        };
+        let want = room.min(self.running[index].prompt_left);
+        for _ in 0..self.running[index].table.blocks_needed(want) {
+            let Some(block) = self.pool.allocate() else {
+                break;
+            };
+            self.running[index].table.push(block);
+        }
+        let sequence = &self.running[index];
+        let take = want.min(sequence.table.capacity() - sequence.table.tokens());
+        if take == 0 {
+            return None;
+        }
+        let last_slice = take == sequence.prompt_left;
+        if last_slice {
+            predicts.push(decodes + take - 1);
+            ids.push(sequence.id);
+        }
+        advanced.push((sequence.id, take));
+        for offset in 0..take {
+            rows.push((index, done + offset));
+        }
+
+        let entries: Vec<(u32, &BlockTable, usize)> = rows
+            .iter()
+            .map(|&(row, position)| {
+                let sequence = &self.running[row];
+                let token = if row == index {
+                    sequence.history[position]
+                } else {
+                    sequence.pending[0]
+                };
+                (token, &sequence.table, position)
+            })
+            .collect();
+        let batch = Batch::unfolded(&entries, &predicts, self.block_size).ok()?;
+
+        self.metrics.steps += 1;
+        self.metrics.mixed_steps += 1;
+        self.metrics.decode_rows += decodes as u64;
+        if decodes > 0 {
+            self.metrics.decode_steps += 1;
+        }
+        Some(Plan::Mixed {
+            ids,
+            advanced,
+            batch,
+        })
+    }
+
+    /// Move the first waiting sequence into the running set without running it,
+    /// so its prompt can be fed a slice at a time.
+    fn start_next_prompt(&mut self) {
+        let Some(candidate) = self.waiting.front() else {
+            return;
+        };
+        let prompt_len = candidate.pending.len();
+        if self.pool.available() == 0 {
+            self.metrics.admission_stalls += 1;
+            return;
+        }
+        let Some(mut sequence) = self.waiting.pop_front() else {
+            return;
+        };
+        let shared = self.claim_prefix(&mut sequence);
+        self.metrics.cached_tokens += shared as u64;
+        self.metrics.prefilled_tokens += (prompt_len - shared) as u64;
+        // Every block of it may already be resident, and it still has to run its
+        // last token to produce anything, so at least one token is always left.
+        sequence.prompt_left = (prompt_len - shared).max(1);
+        sequence.pending.clear();
+        self.metrics.prefills += 1;
+        self.running.push(sequence);
     }
 
     /// Give a waiting sequence its blocks and run its prompt.
@@ -311,12 +521,6 @@ impl Scheduler {
     fn admit(&mut self) -> Option<Plan> {
         let prompt_len = self.waiting.front()?.pending.len();
         let needed = prompt_len.div_ceil(self.block_size);
-        if needed > self.pool.total() {
-            let mut sequence = self.waiting.pop_front()?;
-            sequence.finish = Some(Finish::Length);
-            self.pool.free_table(&mut sequence.table);
-            return Some(Plan::Refused { id: sequence.id });
-        }
         if needed > self.pool.available() {
             self.metrics.admission_stalls += 1;
             return None;
@@ -439,8 +643,23 @@ impl Scheduler {
             return Plan::Idle;
         };
         self.metrics.steps += 1;
+        self.metrics.decode_steps += 1;
         self.metrics.decode_rows += ids.len() as u64;
         Plan::Decode { ids, batch }
+    }
+
+    /// Reject a waiting prompt the pool could never hold, whatever the pass
+    /// shape. Slicing it changes how much runs at once, not how much has to be
+    /// resident once it has run.
+    fn refuse_unservable(&mut self) -> Option<Plan> {
+        let prompt_len = self.waiting.front()?.pending.len();
+        if prompt_len.div_ceil(self.block_size) <= self.pool.total() {
+            return None;
+        }
+        let mut sequence = self.waiting.pop_front()?;
+        sequence.finish = Some(Finish::Length);
+        self.pool.free_table(&mut sequence.table);
+        Some(Plan::Refused { id: sequence.id })
     }
 
     /// The most recently admitted resident that is not `protect`.
@@ -458,6 +677,7 @@ impl Scheduler {
         // together, which is what makes eviction cost a prefill rather than an
         // answer. The tokens already returned to the client stay returned.
         sequence.pending.clone_from(&sequence.history);
+        sequence.prompt_left = 0;
         sequence.preemptions += 1;
         self.metrics.preemptions += 1;
         self.metrics.recomputed_tokens += sequence.history.len() as u64;
@@ -469,13 +689,14 @@ impl Scheduler {
     /// `sampled` is one token per row of the plan, in the same order.
     pub fn commit(&mut self, plan: &Plan, sampled: &[u32]) -> Outcome {
         let mut outcome = Outcome::default();
-        if let Some(batch) = plan.batch() {
-            for &id in plan.ids() {
+        for (id, written) in plan.advanced() {
+            {
                 let Some(index) = self.running.iter().position(|s| s.id == id) else {
                     continue;
                 };
                 let sequence = &mut self.running[index];
-                let _ = sequence.table.advance(batch.seq);
+                let _ = sequence.table.advance(written);
+                sequence.prompt_left = sequence.prompt_left.saturating_sub(written);
                 // Name whatever this pass filled, so the sequence after it can
                 // take the blocks instead of computing them again. Done here
                 // rather than in the pass, because only the caller knows the
@@ -583,7 +804,10 @@ mod tests {
 
     #[test]
     fn a_prompt_is_admitted_before_anything_decodes() {
+        // Prefill-first, which is what `--chunk off` still selects and what the
+        // chunked comparison measures against.
         let mut scheduler = scheduler(64, 4, 4);
+        scheduler.set_chunk(None);
         scheduler.submit(sequence(1, 3, 10));
         scheduler.submit(sequence(2, 5, 10));
 
@@ -622,6 +846,7 @@ mod tests {
     #[test]
     fn sequences_that_arrive_late_join_the_batch_that_is_already_running() {
         let mut scheduler = scheduler(64, 8, 4);
+        scheduler.set_chunk(None);
         scheduler.submit(sequence(1, 3, 20));
         step(&mut scheduler, 7);
         for _ in 0..3 {
@@ -656,8 +881,10 @@ mod tests {
     #[test]
     fn the_pool_running_dry_evicts_the_newest_and_recomputes_it() {
         // Four blocks of four tokens, two prompts of four: room for both and
-        // one spare block each, so the pool empties two decodes in.
+        // one spare block each, so the pool empties two decodes in. Counted on
+        // the folded schedule, where each prompt is exactly one pass.
         let mut scheduler = scheduler(4, 4, 50);
+        scheduler.set_chunk(None);
         scheduler.submit(sequence(1, 4, 50));
         scheduler.submit(sequence(2, 4, 50));
         step(&mut scheduler, 7);
@@ -861,6 +1088,7 @@ mod tests {
     #[test]
     fn the_average_batch_counts_only_decode_passes() {
         let mut scheduler = scheduler(64, 8, 4);
+        scheduler.set_chunk(None);
         scheduler.submit(sequence(1, 2, 10));
         scheduler.submit(sequence(2, 2, 10));
         step(&mut scheduler, 7);
@@ -872,5 +1100,155 @@ mod tests {
         assert_eq!(metrics.prefills, 2);
         assert_eq!(metrics.steps, 5);
         assert!((metrics.mean_batch() - 2.0).abs() < 1e-9, "{metrics:?}");
+    }
+
+    #[test]
+    fn a_long_prompt_is_fed_a_slice_at_a_time_and_no_pass_exceeds_the_budget() {
+        let mut scheduler = scheduler(64, 8, 8);
+        scheduler.set_chunk(Some(16));
+        scheduler.submit(sequence(1, 100, 4));
+
+        let mut slices = 0;
+        let mut fed = 0;
+        loop {
+            let (plan, outcome) = step(&mut scheduler, 7);
+            match plan {
+                Plan::Mixed { batch, .. } => {
+                    assert!(batch.rows <= 16, "a pass ran {} rows over 16", batch.rows);
+                    slices += 1;
+                    fed += batch.rows;
+                }
+                // The prompt is through and the sequence is decoding normally.
+                Plan::Decode { .. } => break,
+                other => panic!("expected a slice, got {other:?}"),
+            }
+            assert!(slices < 20, "the prompt never finished");
+            // Nothing comes back until the last slice has run.
+            if outcome.tokens.is_empty() {
+                assert!(fed < 100, "the prompt ran out without producing a token");
+            }
+        }
+        assert!(
+            slices >= 6,
+            "100 tokens in slices of 16 is at least 7 passes, got {slices}"
+        );
+        assert_eq!(fed, 100, "every prompt token runs exactly once");
+    }
+
+    #[test]
+    fn a_prompt_arriving_mid_flight_does_not_stop_the_sequences_already_decoding() {
+        let mut scheduler = scheduler(64, 8, 8);
+        scheduler.set_chunk(Some(16));
+        scheduler.submit(sequence(1, 4, 40));
+        scheduler.submit(sequence(2, 4, 40));
+        // Both through their prompts and decoding.
+        for _ in 0..6 {
+            step(&mut scheduler, 7);
+        }
+        assert_eq!(scheduler.running(), 2);
+
+        scheduler.submit(sequence(3, 90, 40));
+        // Every pass the newcomer's prompt takes, the two residents still get a
+        // token. Without chunking the same prompt would be one pass in which
+        // they get nothing.
+        for pass in 0..5 {
+            let (plan, outcome) = step(&mut scheduler, 7);
+            assert!(matches!(plan, Plan::Mixed { .. }), "pass {pass}: {plan:?}");
+            let produced: Vec<u64> = outcome.tokens.iter().map(|&(id, _)| id).collect();
+            assert!(
+                produced.contains(&1) && produced.contains(&2),
+                "pass {pass} starved a running sequence: {produced:?}"
+            );
+            assert!(
+                !produced.contains(&3),
+                "pass {pass} answered a half-run prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prompts_last_slice_is_the_one_that_produces_its_first_token() {
+        let mut scheduler = scheduler(64, 8, 8);
+        scheduler.set_chunk(Some(16));
+        scheduler.submit(sequence(1, 40, 4));
+
+        let mut answered = Vec::new();
+        for _ in 0..4 {
+            let (_, outcome) = step(&mut scheduler, 7);
+            answered.push(!outcome.tokens.is_empty());
+        }
+        // Forty tokens in slices of sixteen is three passes, and only the third
+        // asks for logits.
+        assert_eq!(answered, vec![false, false, true, true], "{answered:?}");
+    }
+
+    #[test]
+    fn the_budget_covers_the_decodes_and_the_slice_together() {
+        let mut scheduler = scheduler(64, 8, 8);
+        scheduler.set_chunk(Some(8));
+        for id in 1..=3 {
+            scheduler.submit(sequence(id, 2, 40));
+        }
+        for _ in 0..6 {
+            step(&mut scheduler, 7);
+        }
+        assert_eq!(scheduler.running(), 3);
+
+        scheduler.submit(sequence(9, 60, 40));
+        let (plan, _) = step(&mut scheduler, 7);
+        match plan {
+            Plan::Mixed {
+                batch, advanced, ..
+            } => {
+                assert_eq!(batch.rows, 8, "the pass should fill the budget exactly");
+                // Three residents took one row each, so the slice got five.
+                let slice = advanced.iter().find(|&&(id, _)| id == 9).map(|&(_, n)| n);
+                assert_eq!(slice, Some(5), "{advanced:?}");
+            }
+            other => panic!("expected a mixed pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunking_off_gives_a_prompt_its_own_pass_and_on_does_not() {
+        for (chunk, prompt_alone) in [(None, true), (Some(16), false)] {
+            let mut scheduler = scheduler(64, 8, 8);
+            scheduler.set_chunk(chunk);
+            scheduler.submit(sequence(1, 4, 40));
+            for _ in 0..3 {
+                step(&mut scheduler, 7);
+            }
+            scheduler.submit(sequence(2, 20, 40));
+            let (_, outcome) = step(&mut scheduler, 7);
+            let resident_kept_going = outcome.tokens.iter().any(|&(id, _)| id == 1);
+            assert_eq!(
+                resident_kept_going, !prompt_alone,
+                "chunk {chunk:?} put the resident in the wrong place"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dry_pool_evicts_under_chunking_too_rather_than_stalling() {
+        // Six blocks of four, three sequences: the pool runs out while a fourth
+        // prompt is being fed a slice at a time.
+        let mut scheduler = scheduler(6, 4, 50);
+        scheduler.set_chunk(Some(8));
+        for id in 1..=3 {
+            scheduler.submit(sequence(id, 4, 50));
+        }
+        for _ in 0..20 {
+            step(&mut scheduler, 7);
+        }
+        let metrics = scheduler.metrics();
+        assert!(
+            metrics.preemptions > 0,
+            "nothing was ever evicted: {metrics:?}"
+        );
+        assert!(metrics.tokens > 20, "generation stalled: {metrics:?}");
+        assert!(
+            scheduler.running() + scheduler.waiting() == 3,
+            "a sequence was lost between the queue and the running set"
+        );
     }
 }

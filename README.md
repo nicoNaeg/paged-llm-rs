@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 7 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. Requests that begin the same way share the blocks holding that beginning. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
+**Status: stage 8 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. Requests that begin the same way share the blocks holding that beginning, and a long prompt arriving mid-flight is fed a slice per pass rather than stopping everything already generating. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
 
 ## Design
 
@@ -150,7 +150,8 @@ The scheduler hands out blocks from a pool allocated once. A sequence holds a
 list of blocks rather than a run of memory, and takes another only when its last
 one fills. Admission comes first and takes the whole pass, so a prompt arriving
 stalls everything already decoding, which is the design vLLM shipped before
-chunked prefill and the stall stage 8 removes. When the pool runs dry the newest
+chunked prefill. That policy is still reachable with `--chunk off`, and what
+replaced it is measured against it below. When the pool runs dry the newest
 resident sequence is evicted, its blocks are returned, and it goes back to the
 front of the queue to be recomputed. Waiting instead would deadlock: if every
 resident sequence needs a block and none can finish without one, nothing frees
@@ -461,6 +462,66 @@ to make sharing wrong if the naming is wrong: the same block contents after
 different prefixes, prefixes that agree and then part, and a prompt whose blocks
 were evicted between two runs.
 
+## What a long prompt does to everyone else
+
+    make bench-chunk
+
+Prefill-first gives an admitted prompt the entire pass. Every sequence already
+decoding produces nothing until that prefill is done, and on a long prompt that
+is not a hiccup, it is a stop a streaming client sees. Chunked prefill cuts the
+prompt into slices and puts one slice in each pass beside everybody's next
+token.
+
+A batch is a rectangle, and a 128-token slice next to four one-token decodes is
+not one. So the pass is unfolded instead: one row per token, `seq` of one, each
+row carrying its own position and its own block table. The mask and the kernel
+needed no change at all, because both already read a position and a table per
+row. What did need care is the projection at the end. Only the rows somebody
+reads are put through the 151 936-wide output matrix, and a slice in the middle
+of a prompt asks for none: projecting a 512-token slice in full would be 311 MB
+of logits produced and moved so that nobody could look at them.
+
+Measured on four clients streaming when a prompt of about 810 words arrives.
+What is timed is the gap between one token and the next, for the clients that
+were already running. The median says nothing here, since the stall is one gap
+in a hundred:
+
+| `--chunk` | median gap | worst gap | gaps over 100 ms | total stalled | newcomer's first token |
+| --- | --- | --- | --- | --- | --- |
+| off | 30.3 ms | 1349 ms | 5 | 5517 ms | 1305 ms |
+| 512 | 30.2 ms | 680 ms | 8 | 4899 ms | 1237 ms |
+| **128** | 30.4 ms | **263 ms** | 24 | 4717 ms | 1293 ms |
+| 64 | 30.4 ms | 144 ms | 28 | 3496 ms | 1523 ms |
+| 32 | 30.8 ms | 94 ms | 0 | 0 ms | 2241 ms |
+
+M4 Pro, Metal, Qwen3-0.6B bf16, blocks of 16, prefix cache off so the prompt is
+really computed.
+
+**The worst gap falls by 5.1 at the default and the work does not go anywhere.**
+That is the honest reading of the table and it is why the last three columns are
+in it. Slicing a prefill does not make it cheaper, it spreads it: the number of
+gaps a client would notice as a pause goes from 5 to 24, while the time spent in
+them barely moves. What changes is that no single one of them is a second long.
+
+**Below 64 the fixed cost of a pass takes over.** At a slice of 32 no gap exceeds
+100 ms at all, and the arriving prompt pays 1.7x for its own first token, since
+its prefill is now spread over 35 passes whose overhead it pays each time. That
+is the crossover, and it is the reason the default is a measurement on this
+machine rather than a constant copied from another engine. 128 buys the 5.1x for
+nothing measurable; 64 buys 9.4x for 13 % of the newcomer's first token, which is
+a trade the flag leaves open.
+
+The scheduler tests cover the policy without a model: that a prompt is fed a
+slice at a time and no pass exceeds its budget, that residents keep producing a
+token on every pass while a newcomer's prompt goes through, that only a prompt's
+last slice produces anything, and that a dry pool still evicts rather than
+stalling. What none of them can see is whether a sliced prompt computes the same
+thing as a whole one, so `crates/pagedllm/tests/batching.rs` runs the same prompt
+whole and in slices of 1, 3, 4, 7 and its full length, and requires the logits to
+agree. Slices that do not line up with the block size are in that list on
+purpose: a boundary landing mid-block is where a position offset goes wrong
+without changing any shape.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -472,7 +533,7 @@ Each stage lands with its tests before the next one starts.
 5. **Paged attention kernel** (built): the Metal kernel that reads keys and values through a block table on a decode step, compiled from source at startup, checked against a scalar reference and against the tensor path it replaces.
 6. **Benchmarks and profiling** (built): against `llama-server` and `mistral.rs` on this machine with the same model, driven by `guidellm`, plus a Metal System Trace of a decode step.
 7. **Prefix caching** (built): full blocks are named by a hash chained over everything before them, so requests sharing a system prompt share physical blocks instead of recomputing them.
-8. **Chunked prefill** (planned): a long prompt processed a slice per step, so an arriving request stops adding a latency spike to every sequence already decoding.
+8. **Chunked prefill** (built): a long prompt fed a slice per pass, in the same pass as everybody else's next token, so an arriving request stops adding a latency spike to every sequence already decoding.
 
 Quantized KV cache blocks and speculative decoding are not in the plan. They enter it if a measurement asks for them.
 
@@ -500,7 +561,6 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
 Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the components.
 
     make build       release build with the Metal backend
-    make server      start the server
     make server      start the server on port 8000
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device, the kernel among them
@@ -508,6 +568,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make bench-concurrency   what batching buys and what the reservation costs
     make bench-engines       against llama.cpp and mistral.rs, driven by guidellm
     make bench-prefix        what a shared prompt buys, and what it costs without one
+    make bench-chunk         what a long prompt does to the sequences already generating
     make profile             a Metal System Trace of a decode step
     make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets

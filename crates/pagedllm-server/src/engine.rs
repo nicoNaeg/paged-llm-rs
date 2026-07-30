@@ -58,6 +58,10 @@ pub struct PoolConfig {
     pub attention: AttentionKind,
     /// Whether a request may start from blocks another one left behind.
     pub prefix_cache: bool,
+    /// Most tokens one pass may carry, prompt slices and decodes together.
+    /// `None` runs a prompt whole, which stops every sequence already decoding
+    /// for as long as the prefill takes.
+    pub chunk: Option<usize>,
 }
 
 /// A handle to the engine thread.
@@ -118,6 +122,7 @@ impl Engine {
                 let _ = ready.send(Ok(bytes));
                 let mut scheduler = Scheduler::new(pool.blocks, pool.block_size, pool.max_batch);
                 scheduler.set_prefix_cache(pool.prefix_cache);
+                scheduler.set_chunk(pool.chunk);
                 run(&model, &cache, scheduler, &thread_tokenizer, inbox);
             })
             .map_err(|e| format!("starting the engine thread: {e}"))?;

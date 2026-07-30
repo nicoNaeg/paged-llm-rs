@@ -254,3 +254,62 @@ fn a_batch_with_no_block_for_its_next_token_is_refused() {
     // A row count that does not line up is refused before anything runs.
     assert!(Batch::new(vec![1, 2], 1, &[&table], block_size).is_err());
 }
+
+/// Feed `prompt` through in slices of `slice`, returning the logits of the last
+/// pass. A middle slice asks for nothing, which is what the scheduler does: a
+/// prompt produces no token until its final token has run.
+fn in_slices(model: &Model, block_size: usize, prompt: &[u32], slice: usize) -> Tensor {
+    let (cache, mut allocator) = pool(model, block_size, 64);
+    let mut table = BlockTable::new(block_size);
+
+    let mut last = None;
+    let mut done = 0;
+    while done < prompt.len() {
+        let take = slice.min(prompt.len() - done);
+        grow(&mut allocator, &mut table, take);
+        let entries: Vec<(u32, &BlockTable, usize)> = (done..done + take)
+            .map(|position| (prompt[position], &table, position))
+            .collect();
+        let predicts: Vec<usize> = if done + take == prompt.len() {
+            vec![take - 1]
+        } else {
+            Vec::new()
+        };
+        let batch = Batch::unfolded(&entries, &predicts, block_size).unwrap();
+        let logits = model.forward_batch(&batch, &cache).unwrap();
+        if predicts.is_empty() {
+            assert_eq!(
+                logits.dim(0).unwrap(),
+                0,
+                "a middle slice produced logits nobody asked for"
+            );
+        } else {
+            last = Some(logits);
+        }
+        table.advance(take).unwrap();
+        done += take;
+    }
+    last.expect("the last slice asks for its logits")
+}
+
+#[test]
+fn a_prompt_fed_in_slices_lands_where_one_pass_over_it_lands() {
+    let (model, prompt, tolerance) = load_tiny();
+    let whole = model.forward(&prompt).unwrap();
+    let want = whole
+        .narrow(1, prompt.len() - 1, 1)
+        .unwrap()
+        .reshape((1, ()))
+        .unwrap();
+
+    // Slices that do and do not line up with the block size, because a boundary
+    // landing mid-block is where a position offset goes wrong unnoticed.
+    for slice in [1, 3, 4, 7, prompt.len()] {
+        let got = in_slices(&model, 4, &prompt, slice);
+        let (worst, scale) = compare(&got, &want);
+        assert!(
+            f64::from(worst) <= tolerance,
+            "fed {slice} at a time: off by {worst:.3e} on values up to {scale:.3e}"
+        );
+    }
+}

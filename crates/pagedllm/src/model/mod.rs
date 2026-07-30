@@ -329,9 +329,26 @@ impl Model {
             x = block.forward_batch(&x, &self.rope, layer, batch, cache, &index, self.attention)?;
         }
 
-        let last = x.narrow(1, batch.seq - 1, 1)?.contiguous()?;
-        let logits = self.lm_head.forward(&self.norm.forward(&last)?)?;
-        Ok(logits.reshape((batch.rows, ()))?)
+        // Only the positions somebody reads are projected. Every other one
+        // passed through the model to fill the cache, and putting it through a
+        // 151 936-wide matrix would be the largest multiply of the pass, done
+        // for nothing.
+        // A pass can legitimately want nothing: a slice in the middle of a
+        // prompt runs only to fill the cache, and produces its first token when
+        // its last token has gone through. Returning early rather than
+        // projecting, because index_select over no rows is an error.
+        if batch.logit_rows.is_empty() {
+            return Ok(Tensor::zeros(
+                (0, self.config.vocab_size),
+                x.dtype(),
+                &self.device,
+            )?);
+        }
+        let flat = x.reshape((batch.rows * batch.seq, ()))?;
+        let wanted = Tensor::from_slice(&batch.logit_rows, batch.logit_rows.len(), &self.device)?;
+        let selected = flat.index_select(&wanted, 0)?.contiguous()?;
+        let logits = self.lm_head.forward(&self.norm.forward(&selected)?)?;
+        Ok(logits.reshape((batch.logit_rows.len(), ()))?)
     }
 
     /// Choose which attention implementation runs.
