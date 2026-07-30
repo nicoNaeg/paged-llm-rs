@@ -524,13 +524,36 @@ agree. Slices that do not line up with the block size are in that list on
 purpose: a boundary landing mid-block is where a position offset goes wrong
 without changing any shape.
 
-That differential test has a blind spot worth naming, because the mutation table
-found it rather than a reading of the code. It builds its own batches, so it
-checks that a correct set of positions produces correct logits and never that
-the scheduler produces a correct set: a slice restarting its positions at zero
-survived every suite in the repository. What catches it is a scheduler test that
-reads the positions out of the batch directly. Twenty-one mutations now, all
-caught, and still no suite catching all of them.
+Two blind spots turned up in this stage, and both are worth naming because
+neither was found by reading the code.
+
+The first is the one the committed fixture cannot reach. A slice in the middle of
+a prompt asks for no logits, so the pass produces a result with zero rows, and
+the rule is that nobody may touch it. Nothing enforced that rule at first, and
+every suite passed: the fixture is f32, so the sampler's cast to f32 is a no-op
+and nothing is dispatched. The 0.6B checkpoint is bf16, where the same cast
+dispatches a Metal kernel over zero elements and candle divides by zero working
+out its grid. The server answered 500 to the first request whose prompt was
+longer than one pass with nothing else running, which is the ordinary case of a
+single client sending a long prompt. It is now a check in `scripts/smoke-server.py`,
+verified to fail when the guard is removed, and that is the right level for it:
+the defect needs the real checkpoint, the real dtype and a real request, which is
+what that script exists for.
+
+The second is the differential test's own, and the mutation table found it. That
+test builds its own batches, so it checks that a correct set of positions
+produces correct logits and never that the scheduler produces a correct set: a
+slice restarting its positions at zero survived every suite in the repository.
+What catches it is a scheduler test that reads the positions out of the batch
+directly. Twenty-one mutations now, all caught, and still no suite catching all
+of them.
+
+Slicing also has to leave the answer alone, and that was checked rather than
+assumed. In f32 on Metal the same greedy prompt through `--chunk off` and
+`--chunk 32` comes back identical; in bf16 the two drift into different wordings
+of the same answer, which is the tie-breaking the forward pass section already
+measures. Same method as stage 1: f32 isolates the implementation, bf16 isolates
+the dtype, and neither run alone would support the claim.
 
 ## Build order
 
