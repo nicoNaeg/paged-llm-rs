@@ -30,7 +30,7 @@ pub use candle_core::{DType, Device};
 
 pub use backend::Backend;
 pub use batch::{Batch, CacheConfig, PagedCache};
-pub use blocks::{BlockAllocator, BlockId, BlockTable};
+pub use blocks::{BlockAllocator, BlockHash, BlockId, BlockTable, block_hash};
 pub use chat::ChatTemplate;
 pub use config::{Config, GenerationConfig};
 pub use error::{Error, Result};

@@ -1,4 +1,4 @@
-.PHONY: build server test test-metal test-model smoke bench-concurrency bench-engines profile mutate bench lint fmt venv model model-gguf fixtures reference
+.PHONY: build server test test-metal test-model smoke bench-concurrency bench-engines bench-prefix profile mutate bench lint fmt venv model model-gguf fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
@@ -38,6 +38,10 @@ smoke: build
 # This engine against the others on this machine, driven by guidellm.
 bench-engines: build
 	$(PYTHON) scripts/bench-engines.py
+
+# What a shared prompt buys, and what it costs when nothing is shared.
+bench-prefix: build
+	$(PYTHON) scripts/bench-prefix.py
 
 # A Metal System Trace of a decode under load, written to docs/. Needs a full
 # Xcode, which nothing else here does.

@@ -2,7 +2,7 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 6 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
+**Status: stage 7 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. Requests that begin the same way share the blocks holding that beginning. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
 
 ## Design
 
@@ -402,6 +402,65 @@ load reaches untraced, and the millisecond figure for a step is inflated with
 them. The submissions per step are not, because both rates fall together and
 their ratio survives, and that ratio is what the profile is for.
 
+## Sharing what two requests agree on
+
+    make bench-prefix
+
+A block that is full is also final: nothing will be appended to it, so its keys
+and values are a function of its own tokens and of every token before it. Name it
+after exactly that and two requests which begin the same way can point at one
+copy instead of computing it twice.
+
+The name is a chain. A block's hash combines its own tokens with the hash of the
+block before it, so it stands for the whole prefix rather than for sixteen tokens
+that might appear anywhere. Two prompts that agree for three blocks and then part
+share three and no more, and that falls out of the chain rather than being
+checked for. The same sixteen tokens after a different beginning are a different
+block, which is the property a hash over the block's own contents would not have.
+
+Nothing here needs copy on write, which is worth saying because it is the usual
+complication. Only a full block is ever shared, a full block is never written to
+again, and the partial block a sequence is still filling is always its own.
+
+A block nobody holds keeps its contents and its name until the space is needed.
+Under pressure the pool takes a block carrying no name first, and only then drops
+the name of the one unheld longest. That ordering is the whole policy, and it
+puts the two costs the right way round: losing a cached block costs a
+recomputation that may never be asked for, where preempting a running sequence
+costs one that is certain and immediate.
+
+Apple M4 Pro, Qwen3-0.6B in bf16, blocks of 16, sixteen concurrent requests
+behind a 288-word preamble, `--prefix-cache` the only thing that changes:
+
+| workload | cache | ttft | p95 ttft | tokens/s |
+|----------|-------|------|----------|----------|
+| one shared preamble | off | 2486 ms | 4466 ms | 80.3 |
+| one shared preamble | **on** | **344 ms** | **651 ms** | **222.4** |
+| nothing in common | off | 2363 ms | 4199 ms | 84.5 |
+| nothing in common | on | 2142 ms | 3966 ms | 87.7 |
+
+**A first token arrives 7.2 times sooner** when the preamble is shared, and
+throughput nearly triples, because fifteen of the sixteen requests stop computing
+a prompt that one of them already computed. That is the workload prefix caching
+exists for: a retrieval front end, an agent loop, any chat application with
+instructions.
+
+**On prompts with nothing in common it costs nothing measurable.** The 1.10 in
+that row is inside the run-to-run spread rather than a gain, and the point of the
+row is the absence of a loss: the lookup is one hash per block against a map, and
+it stops at the first block nobody has.
+
+### What the tests check, which is not that sharing happens
+
+A block taken from the cache holds keys and values some other sequence computed.
+If the name stood for anything less than the exact prefix, a request would
+silently continue someone else's context and read as a fluent answer to a
+question nobody asked. So `crates/pagedllm/tests/prefix.rs` checks that a run
+which shares produces the same logits as a run which does not, on prompts built
+to make sharing wrong if the naming is wrong: the same block contents after
+different prefixes, prefixes that agree and then part, and a prompt whose blocks
+were evicted between two runs.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -412,7 +471,7 @@ Each stage lands with its tests before the next one starts.
 4. **Block allocator** (built): the paged layout as pure logic, no GPU involved, allocation, release and block tables, fully unit tested, and wired into the serving path so the memory it buys is measured before the kernel arrives.
 5. **Paged attention kernel** (built): the Metal kernel that reads keys and values through a block table on a decode step, compiled from source at startup, checked against a scalar reference and against the tensor path it replaces.
 6. **Benchmarks and profiling** (built): against `llama-server` and `mistral.rs` on this machine with the same model, driven by `guidellm`, plus a Metal System Trace of a decode step.
-7. **Prefix caching** (planned): a radix tree over block hashes, so requests sharing a system prompt share physical blocks instead of recomputing them.
+7. **Prefix caching** (built): full blocks are named by a hash chained over everything before them, so requests sharing a system prompt share physical blocks instead of recomputing them.
 8. **Chunked prefill** (planned): a long prompt processed a slice per step, so an arriving request stops adding a latency spike to every sequence already decoding.
 
 Quantized KV cache blocks and speculative decoding are not in the plan. They enter it if a measurement asks for them.
@@ -448,6 +507,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make smoke       drive the server over HTTP and print its throughput
     make bench-concurrency   what batching buys and what the reservation costs
     make bench-engines       against llama.cpp and mistral.rs, driven by guidellm
+    make bench-prefix        what a shared prompt buys, and what it costs without one
     make profile             a Metal System Trace of a decode step
     make mutate      put each defect back and check the tests fail
     make lint        rustfmt check, then clippy with warnings denied on both feature sets

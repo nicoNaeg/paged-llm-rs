@@ -56,6 +56,8 @@ pub struct PoolConfig {
     pub max_batch: usize,
     /// Which attention implementation runs on a decode.
     pub attention: AttentionKind,
+    /// Whether a request may start from blocks another one left behind.
+    pub prefix_cache: bool,
 }
 
 /// A handle to the engine thread.
@@ -114,13 +116,9 @@ impl Engine {
                     }
                 };
                 let _ = ready.send(Ok(bytes));
-                run(
-                    &model,
-                    &cache,
-                    Scheduler::new(pool.blocks, pool.block_size, pool.max_batch),
-                    &thread_tokenizer,
-                    inbox,
-                );
+                let mut scheduler = Scheduler::new(pool.blocks, pool.block_size, pool.max_batch);
+                scheduler.set_prefix_cache(pool.prefix_cache);
+                run(&model, &cache, scheduler, &thread_tokenizer, inbox);
             })
             .map_err(|e| format!("starting the engine thread: {e}"))?;
 

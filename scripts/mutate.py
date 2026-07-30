@@ -11,6 +11,12 @@ Each mutation is applied to the source, the suites are run, and the source is
 restored whether they passed, failed or crashed. A mutation no suite catches is
 reported and makes this exit non-zero.
 
+Being interrupted is handled rather than assumed away. A `finally` restores the
+source when a mutation raises, but a signal can step around it, and a run killed
+part-way used to leave a defect sitting in the working tree. The restore is now
+also installed as a signal handler, and the guard that refuses to start on a
+dirty tree is what catches whatever still gets through.
+
 One candidate was tried and removed rather than left red: filling the padding of
 a read rectangle with another sequence's block instead of the row's own. Nothing
 catches it, and nothing should, because the mask hides that padding whatever is
@@ -27,6 +33,7 @@ here: the fixture exists precisely to make structural defects visible without a
 """
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +44,7 @@ LAYERS = ROOT / "crates/pagedllm/src/model/layers.rs"
 ROPE = ROOT / "crates/pagedllm/src/model/rope.rs"
 BATCH = ROOT / "crates/pagedllm/src/batch.rs"
 KERNEL = ROOT / "crates/pagedllm/src/kernels/paged_attention.rs"
+BLOCKS = ROOT / "crates/pagedllm/src/blocks.rs"
 MSL = ROOT / "crates/pagedllm/src/kernels/paged_attention.metal"
 
 # (what the mistake is, file, the code as written, the code with the defect)
@@ -126,6 +134,24 @@ MUTATIONS = [
         "                let visible = start.saturating_sub(1) + offset;",
     ),
     (
+        "a block named by its own tokens rather than by its whole prefix",
+        BLOCKS,
+        "    mix(parent.unwrap_or(0));",
+        "    mix(0);",
+    ),
+    (
+        "a sequence claiming the last block of its prompt as well",
+        ROOT / "crates/pagedllm/src/scheduler.rs",
+        "        let candidates = prompt.len().div_ceil(self.block_size).saturating_sub(1);",
+        "        let candidates = prompt.len().div_ceil(self.block_size);",
+    ),
+    (
+        "a partial block named as though it were full",
+        BLOCKS,
+        "        let full = self.tokens / self.block_size;",
+        "        let full = self.tokens.div_ceil(self.block_size);",
+    ),
+    (
         "the kernel given a context that stops before the new token",
         KERNEL,
         "            .map(|start| u32::try_from(start + 1).unwrap_or(u32::MAX))",
@@ -134,9 +160,15 @@ MUTATIONS = [
 ]
 
 SUITES = [
+    # The unit tests, which are where the scheduler's policy and the allocator's
+    # bookkeeping live. Left out at first, which let three mutations through
+    # that two of these catch: a mutation table is only as wide as the suites it
+    # is given.
+    ("unit", ["--lib"]),
     ("fixture", ["--test", "forward"]),
     ("batching", ["--test", "batching"]),
     ("kernel", ["--test", "kernel"]),
+    ("prefix", ["--test", "prefix"]),
 ]
 if all(
     os.environ.get(name)
@@ -191,6 +223,17 @@ def touched_files_are_clean() -> bool:
     return not done.stdout.strip()
 
 
+def restore_on_signal(path: Path, original: str) -> list:
+    """Put the source back if this run is killed rather than finished."""
+    handlers = []
+    def handler(signum, frame):
+        path.write_text(original)
+        raise SystemExit(f"interrupted; {path.name} restored")
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        handlers.append((sig, signal.signal(sig, handler)))
+    return handlers
+
+
 def main() -> int:
     if not touched_files_are_clean():
         print("the files this rewrites have uncommitted changes; commit or stash first")
@@ -216,12 +259,15 @@ def main() -> int:
             continue
 
         path.write_text(original.replace(written, defective, 1))
+        handlers = restore_on_signal(path, original)
         try:
             built = compiles()
             caught = [not run(suite) for _, suite in SUITES] if built else []
         finally:
             path.write_text(original)
             assert path.read_text() == original, f"failed to restore {path}"
+            for sig, previous in handlers:
+                signal.signal(sig, previous)
 
         if not built:
             print(f"{what:<{width}}{'DOES NOT BUILD':>11}")

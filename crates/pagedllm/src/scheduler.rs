@@ -22,7 +22,7 @@
 use std::collections::VecDeque;
 
 use crate::batch::Batch;
-use crate::blocks::{BlockAllocator, BlockTable};
+use crate::blocks::{BlockAllocator, BlockTable, block_hash};
 use crate::sampler::{Rng, Sampling};
 use crate::session::Finish;
 use crate::{Error, Result};
@@ -178,9 +178,23 @@ pub struct Metrics {
     /// Tokens re-run because their sequence was evicted, which is what
     /// preemption costs and what a benchmark should report next to its gain.
     pub recomputed_tokens: u64,
+    /// Prompt tokens a sequence did not have to compute, because a block
+    /// holding them was already resident.
+    pub cached_tokens: u64,
+    /// Prompt tokens that had to be computed.
+    pub prefilled_tokens: u64,
 }
 
 impl Metrics {
+    /// The share of prompt tokens answered from the cache.
+    pub fn prefix_hit_rate(&self) -> f64 {
+        let asked = self.cached_tokens + self.prefilled_tokens;
+        if asked == 0 {
+            return 0.0;
+        }
+        self.cached_tokens as f64 / asked as f64
+    }
+
     /// Average rows per decode pass, which is what continuous batching buys.
     pub fn mean_batch(&self) -> f64 {
         let decodes = self.steps - self.prefills;
@@ -199,6 +213,8 @@ pub struct Scheduler {
     pool: BlockAllocator,
     block_size: usize,
     max_batch: usize,
+    /// Whether a sequence may start from blocks another one left behind.
+    prefix_cache: bool,
     metrics: Metrics,
 }
 
@@ -213,8 +229,26 @@ impl Scheduler {
             pool: BlockAllocator::new(blocks),
             block_size: block_size.max(1),
             max_batch: max_batch.max(1),
+            prefix_cache: true,
             metrics: Metrics::default(),
         }
+    }
+
+    /// Whether a sequence may start from blocks another one left behind.
+    ///
+    /// On by default, because that is what a serving engine should do, and
+    /// switchable so the two paths can be compared by a flag and checked
+    /// against each other for producing the same tokens.
+    pub fn set_prefix_cache(&mut self, enabled: bool) {
+        self.prefix_cache = enabled;
+        if !enabled {
+            self.pool.clear_cache();
+        }
+    }
+
+    /// Whether sharing is on.
+    pub fn prefix_cache(&self) -> bool {
+        self.prefix_cache
     }
 
     /// Queue a sequence.
@@ -268,13 +302,15 @@ impl Scheduler {
     }
 
     /// Give a waiting sequence its blocks and run its prompt.
+    ///
+    /// Any leading block whose contents another sequence already computed is
+    /// taken rather than filled, and the prefill that follows covers only what
+    /// was not found. The sequence's table then starts part-way along, which the
+    /// batch already understands: it takes each row's offset from how many
+    /// tokens its table holds.
     fn admit(&mut self) -> Option<Plan> {
-        let needed = self
-            .waiting
-            .front()?
-            .pending
-            .len()
-            .div_ceil(self.block_size);
+        let prompt_len = self.waiting.front()?.pending.len();
+        let needed = prompt_len.div_ceil(self.block_size);
         if needed > self.pool.total() {
             let mut sequence = self.waiting.pop_front()?;
             sequence.finish = Some(Finish::Length);
@@ -287,11 +323,28 @@ impl Scheduler {
         }
 
         let mut sequence = self.waiting.pop_front()?;
-        for _ in 0..needed {
-            let block = self.pool.allocate().expect("checked against available");
+        let shared = self.claim_prefix(&mut sequence);
+        // Never every block: a sequence that matched its whole prompt would
+        // have nothing to run, and the token it is about to produce needs a
+        // position to be written at. The last block is always its own.
+        for _ in 0..sequence.table.blocks_needed(prompt_len - shared) {
+            let Some(block) = self.pool.allocate() else {
+                // The cache gave way and there is still nothing. Put it back
+                // rather than admitting it half-served.
+                self.pool.free_table(&mut sequence.table);
+                sequence.pending.clone_from(&sequence.history);
+                self.waiting.push_front(sequence);
+                self.metrics.admission_stalls += 1;
+                return None;
+            };
             sequence.table.push(block);
         }
-        let tokens = std::mem::take(&mut sequence.pending);
+
+        self.metrics.cached_tokens += shared as u64;
+        self.metrics.prefilled_tokens += (prompt_len - shared) as u64;
+
+        let all = std::mem::take(&mut sequence.pending);
+        let tokens = all[shared..].to_vec();
         let seq = tokens.len();
         let batch = Batch::new(tokens, seq, &[&sequence.table], self.block_size).ok()?;
         let id = sequence.id;
@@ -302,6 +355,38 @@ impl Scheduler {
             ids: vec![id],
             batch,
         })
+    }
+
+    /// Take the blocks that already hold this prompt's leading tokens.
+    ///
+    /// Returns how many tokens the sequence therefore does not have to compute.
+    /// The walk stops at the first block nobody has: the chain of hashes means a
+    /// later block's name depends on this one, so a gap cannot be stepped over.
+    fn claim_prefix(&mut self, sequence: &mut Sequence) -> usize {
+        if !self.prefix_cache {
+            return 0;
+        }
+        let prompt = &sequence.pending;
+        // The last block of the prompt is left alone even when it is full, so
+        // the pass has at least one token to run and the sequence owns the block
+        // it is about to write into.
+        let candidates = prompt.len().div_ceil(self.block_size).saturating_sub(1);
+
+        let mut parent = None;
+        let mut shared = 0usize;
+        for index in 0..candidates {
+            let start = index * self.block_size;
+            let tokens = &prompt[start..start + self.block_size];
+            let hash = block_hash(parent, tokens);
+            let Some(block) = self.pool.acquire_cached(hash) else {
+                self.pool.record_miss();
+                break;
+            };
+            sequence.table.push_cached(block, hash);
+            shared += self.block_size;
+            parent = Some(hash);
+        }
+        shared
     }
 
     /// Advance every resident sequence by one token, evicting where the pool
@@ -386,8 +471,20 @@ impl Scheduler {
         let mut outcome = Outcome::default();
         if let Some(batch) = plan.batch() {
             for &id in plan.ids() {
-                if let Some(sequence) = self.running.iter_mut().find(|s| s.id == id) {
-                    let _ = sequence.table.advance(batch.seq);
+                let Some(index) = self.running.iter().position(|s| s.id == id) else {
+                    continue;
+                };
+                let sequence = &mut self.running[index];
+                let _ = sequence.table.advance(batch.seq);
+                // Name whatever this pass filled, so the sequence after it can
+                // take the blocks instead of computing them again. Done here
+                // rather than in the pass, because only the caller knows the
+                // pass succeeded and the tokens are really there.
+                if self.prefix_cache {
+                    let history = sequence.history.clone();
+                    for (block, hash) in self.running[index].table.newly_full(&history) {
+                        self.pool.publish(block, hash);
+                    }
                 }
             }
         }
@@ -629,6 +726,119 @@ mod tests {
     fn an_idle_scheduler_plans_nothing() {
         let mut scheduler = scheduler(8, 4, 4);
         assert!(matches!(scheduler.plan(), Plan::Idle));
+    }
+
+    /// A prompt seen twice is computed once.
+    #[test]
+    fn a_second_request_with_the_same_prompt_reuses_the_blocks_of_the_first() {
+        let mut scheduler = scheduler(64, 4, 4);
+        scheduler.submit(sequence(1, 12, 4));
+        for _ in 0..5 {
+            step(&mut scheduler, 7);
+        }
+        assert_eq!(scheduler.running(), 0, "the first finished and let go");
+        let first = scheduler.metrics();
+        assert_eq!(first.cached_tokens, 0, "nothing to share on the way in");
+        assert!(first.prefilled_tokens >= 12);
+
+        scheduler.submit(sequence(2, 12, 4));
+        step(&mut scheduler, 7);
+        let second = scheduler.metrics();
+        // Twelve tokens is three blocks of four; the last is left alone so the
+        // pass has something to run, so two are taken and four tokens computed.
+        assert_eq!(second.cached_tokens, 8);
+        assert_eq!(second.prefilled_tokens - first.prefilled_tokens, 4);
+    }
+
+    /// Two prompts that agree for a while share exactly that much.
+    #[test]
+    fn sharing_stops_where_the_prompts_stop_agreeing() {
+        let mut scheduler = scheduler(64, 4, 4);
+        let common: Vec<u32> = (0..12).collect();
+
+        let mut first = common.clone();
+        first.extend([100, 101, 102, 103]);
+        let mut second = common.clone();
+        second.extend([200, 201, 202, 203]);
+
+        let build = |id: u64, prompt: Vec<u32>| {
+            Sequence::new(id, prompt, Sampling::greedy(), 2, vec![99], id).unwrap()
+        };
+        scheduler.submit(build(1, first));
+        for _ in 0..4 {
+            step(&mut scheduler, 7);
+        }
+        let before = scheduler.metrics().cached_tokens;
+
+        scheduler.submit(build(2, second));
+        step(&mut scheduler, 7);
+        // The twelve tokens they agree on are three blocks; the fourth differs
+        // and is never a candidate anyway, being the prompt's last.
+        assert_eq!(scheduler.metrics().cached_tokens - before, 12);
+    }
+
+    /// A sequence still running holds its blocks, and a second one may read them.
+    #[test]
+    fn a_prefix_can_be_shared_while_its_first_owner_is_still_generating() {
+        let mut scheduler = scheduler(64, 4, 100);
+        scheduler.submit(sequence(1, 12, 50));
+        for _ in 0..3 {
+            step(&mut scheduler, 7);
+        }
+        assert_eq!(scheduler.running(), 1, "still going");
+
+        scheduler.submit(sequence(2, 12, 50));
+        step(&mut scheduler, 7);
+        assert_eq!(
+            scheduler.metrics().cached_tokens,
+            8,
+            "shared with a live sequence"
+        );
+        assert_eq!(scheduler.running(), 2);
+    }
+
+    /// The flag has to actually turn it off.
+    #[test]
+    fn nothing_is_shared_when_the_cache_is_off() {
+        let mut scheduler = scheduler(64, 4, 4);
+        scheduler.set_prefix_cache(false);
+        assert!(!scheduler.prefix_cache());
+        for id in 1..=2 {
+            scheduler.submit(sequence(id, 12, 4));
+            for _ in 0..5 {
+                step(&mut scheduler, 7);
+            }
+        }
+        assert_eq!(scheduler.metrics().cached_tokens, 0);
+        assert!(scheduler.metrics().prefix_hit_rate() < f64::EPSILON);
+    }
+
+    /// A pool under pressure drops names rather than refusing to serve.
+    #[test]
+    fn cached_blocks_give_way_before_a_sequence_is_refused() {
+        // Five blocks. A twelve-token prompt takes three and its first output
+        // token takes a fourth, so a sequence fits, and three of them in a row
+        // do not fit together with every name kept.
+        let mut scheduler = scheduler(5, 4, 4);
+        for id in 1..=3u64 {
+            let prompt: Vec<u32> = (0..12)
+                .map(|t| t + u32::try_from(id).unwrap() * 1000)
+                .collect();
+            scheduler
+                .submit(Sequence::new(id, prompt, Sampling::greedy(), 2, vec![99], id).unwrap());
+            for _ in 0..4 {
+                step(&mut scheduler, 7);
+            }
+        }
+        // Every one of them ran, none was refused, and the cache absorbed the
+        // pressure by losing names.
+        assert_eq!(scheduler.waiting(), 0);
+        assert_eq!(scheduler.running(), 0);
+        assert!(
+            scheduler.pool().evictions() > 0,
+            "{:?}",
+            scheduler.metrics()
+        );
     }
 
     #[test]
