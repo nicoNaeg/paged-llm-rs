@@ -1251,4 +1251,54 @@ mod tests {
             "a sequence was lost between the queue and the running set"
         );
     }
+
+    #[test]
+    fn a_slices_tokens_carry_the_positions_they_hold_in_the_prompt() {
+        // The differential test cannot see this one: it builds its own batches,
+        // so it checks that a correct set of positions gives correct logits and
+        // never that the scheduler produces a correct set. Nothing else reads
+        // `starts`, so nothing else would notice a slice restarting at zero.
+        let mut scheduler = scheduler(64, 8, 8);
+        scheduler.set_chunk(Some(16));
+        scheduler.submit(sequence(1, 4, 40));
+        for _ in 0..3 {
+            step(&mut scheduler, 7);
+        }
+        assert_eq!(
+            scheduler.running(),
+            1,
+            "the resident should still be running"
+        );
+
+        scheduler.submit(sequence(2, 40, 4));
+        let mut expected = 0;
+        for pass in 0..3 {
+            let plan = scheduler.plan();
+            let Plan::Mixed {
+                batch, advanced, ..
+            } = &plan
+            else {
+                panic!("pass {pass}: expected a mixed pass, got {plan:?}");
+            };
+            let slice = advanced
+                .iter()
+                .find(|&&(id, _)| id == 2)
+                .map(|&(_, n)| n)
+                .expect("the slice is booked against its sequence");
+            // The resident's rows come first, then the slice's, each carrying
+            // the position it holds in the prompt.
+            let first = batch.rows - slice;
+            for offset in 0..slice {
+                assert_eq!(
+                    batch.starts[first + offset],
+                    expected + offset,
+                    "pass {pass}, token {offset} of the slice"
+                );
+            }
+            expected += slice;
+            let ids = plan.ids().len();
+            scheduler.commit(&plan, &vec![7; ids]);
+        }
+        assert_eq!(expected, 40, "the whole prompt ran exactly once");
+    }
 }
