@@ -57,7 +57,7 @@ Qwen3 differs from Llama in three ways that do not fail loudly. An RMS norm is a
 
 So the check is not the logits. It is every module boundary, against activations dumped from the HuggingFace implementation by `scripts/dump_reference.py`, at two scales that answer different questions.
 
-The small one is two layers at toy widths with weights from a fixed seed, and it is committed under `crates/pagedllm/tests/fixtures/tiny`. Its widths are chosen against specific mistakes: the head width is 16 where the quotient is 8, the grouping ratio is 2, and no matrix is square, so a transposed weight cannot pass by accident. At 184 KB it runs in CI on the CPU path, which is what makes structural correctness something the repository checks rather than something this file claims.
+The small one is two layers at toy widths with weights from a fixed seed, and it is committed under `crates/pagedllm/tests/fixtures/tiny`. Its widths are chosen against specific mistakes: the head width is 16 where `hidden_size / num_attention_heads` is 6, the grouping ratio is 2, and no weight matrix is square, so a transposed one cannot pass by accident. At 156 KB it runs in CI on the CPU path, which is what makes structural correctness something the repository checks rather than something this file claims.
 
     make fixtures && cargo test
 

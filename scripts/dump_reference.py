@@ -59,12 +59,14 @@ def tiny_config() -> Qwen3Config:
     hidden_size / num_attention_heads is 8, so an implementation that derives
     the head width instead of reading it produces wrong shapes. Four query heads
     over two key heads make the grouping ratio 2, so a repeat_kv that broadcasts
-    in the wrong order lands on the wrong head. Nothing here is square, so a
-    transposed weight cannot pass by accident.
+    in the wrong order lands on the wrong head. And no weight matrix is square,
+    so a transposed one cannot pass by accident: that is what hidden_size 24 is
+    for, since at 32 it equalled num_key_value_heads * head_dim and left k_proj
+    and v_proj square.
     """
     return Qwen3Config(
         vocab_size=128,
-        hidden_size=32,
+        hidden_size=24,
         intermediate_size=48,
         num_hidden_layers=2,
         num_attention_heads=4,

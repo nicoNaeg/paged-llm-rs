@@ -9,7 +9,7 @@
   "eos_token_id": null,
   "head_dim": 16,
   "hidden_act": "silu",
-  "hidden_size": 32,
+  "hidden_size": 24,
   "initializer_range": 0.02,
   "intermediate_size": 48,
   "layer_types": [
