@@ -2,7 +2,42 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
-**Status: stage 8 of 8 built.** The forward pass runs on the CPU and on Metal, checked against the reference implementation at every module boundary, an `OpenAI`-compatible server generates from it over HTTP with streaming, and a scheduler advances many sequences on one forward pass against a KV cache that is a pool of blocks, and a hand-written Metal kernel reads that pool in place. Every layout it replaced is still reachable by a flag, so the figures below compare them without a checkout, and each gain is measured on its own. Requests that begin the same way share the blocks holding that beginning, and a long prompt arriving mid-flight is fed a slice per pass rather than stopping everything already generating. It is also measured against `llama.cpp` and `mistral.rs` on this machine, by the same client, including where it loses.
+**All eight stages built.** Every number here comes from a committed benchmark,
+with the command that produces it, on one machine: an Apple M4 Pro running
+Qwen3-0.6B in bfloat16.
+
+    make model     # Qwen3-0.6B from HuggingFace, 1.5 GB, not committed
+    make build     # release build with the Metal backend
+    make server    # OpenAI-compatible, on port 8000
+
+| what it buys | measured | command |
+|---|---|---|
+| paging and a hand-written Metal kernel, against one reservation a sequence | 63.3 to **779.8** tok/s at 64 clients | `make bench-concurrency` |
+| sharing the blocks two prompts agree on | first token 2486 to **344 ms** | `make bench-prefix` |
+| feeding a long prompt a slice per pass | worst gap between two tokens 1087 to **220 ms** | `make bench-chunk` |
+| against `llama.cpp` at 64 clients | **500 ms** to first token against 2092, and 644 tok/s against 771 | `make bench-engines` |
+
+The last row is the one to read twice. llama.cpp is faster on throughput at every
+level and this engine does not catch it; it answers first by four times. That is
+the scheduler doing its job while the kernels are not yet doing theirs, and the
+section on it says so at length rather than picking the flattering column.
+
+**Written here**: the scheduler, the block allocator, the block tables, the paged
+attention kernel and the CPU implementation that is its oracle, the batching
+policy, the prefix cache, the sampler, and the Qwen3 forward pass. **Taken from
+candle**: tensors, safetensors loading, and matrix multiplication.
+
+**Contents.** [Design](#design) and [architecture](#architecture) first, then one
+section per stage in the order they were built: [the forward
+pass](#the-forward-pass-and-how-it-is-known-to-be-right), [the
+server](#serving-the-openai-api), [continuous batching against a
+reservation](#continuous-batching-and-what-a-reservation-costs), [the
+kernel](#the-kernel-and-the-question-it-answered), [the comparison against the
+other engines](#against-the-other-engines-same-machine-same-client), [where a
+decode step's time goes](#where-a-decode-steps-time-goes), [prefix
+caching](#sharing-what-two-requests-agree-on) and [chunked
+prefill](#what-a-long-prompt-does-to-everyone-else). Each one carries the result
+that goes against it.
 
 ## Design
 
