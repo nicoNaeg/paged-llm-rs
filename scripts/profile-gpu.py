@@ -34,6 +34,7 @@ startup rather than ahead of time.
 import json
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -92,6 +93,19 @@ def rows(schema: str) -> int:
     return len(re.findall(r"<row>", out.stdout))
 
 
+def port_is_free() -> bool:
+    """Nothing must already answer on this port.
+
+    A server left behind by an interrupted run answers `/health` just as well as
+    the one being started, so without this the script measures the survivor and
+    reports it under the new configuration's name. That happened once, to
+    `bench-engines.py`, and cost a whole table.
+    """
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", PORT)) != 0
+
+
 def main() -> int:
     if not shutil.which("xcrun") or subprocess.run(
         ["xcrun", "xctrace", "version"], capture_output=True
@@ -107,6 +121,8 @@ def main() -> int:
     if TRACE.exists():
         shutil.rmtree(TRACE)
 
+    if not port_is_free():
+        raise SystemExit(f"something already answers on port {PORT}")
     server = subprocess.Popen(
         [
             str(BINARY),
@@ -121,6 +137,8 @@ def main() -> int:
     try:
         started = time.time()
         while time.time() - started < 180:
+            if server.poll() is not None:
+                raise SystemExit(f"the server exited with {server.returncode}")
             try:
                 urllib.request.urlopen(BASE + "/health", timeout=1)
                 break

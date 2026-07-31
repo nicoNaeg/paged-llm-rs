@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Put each defect the forward-pass tests exist for back, and check they fail.
+"""Put each defect the tests exist for back, and check they fail.
 
 A test that has never failed is not evidence. Every mutation below is a real
-mistake, the kind someone porting a Llama implementation to Qwen3 makes, and
-every one of them produces a model that still loads, still runs and still writes
-fluent text. That is exactly why they need a test that catches them, and why the
-test needs checking in turn.
+mistake: porting a Llama implementation to Qwen3, resolving a block table,
+naming a cached block, positioning a prompt slice. Every one of them produces an
+engine that still loads, still runs and still writes fluent text. That is
+exactly why they need a test that catches them, and why the test needs checking
+in turn.
+
+The suites are one per part of the engine and the shape of the table is the
+result: no suite catches everything, and each mutation is caught by at least
+one. A differential test cannot see a defect that moves both of its sides
+equally, which is why they are not merged into one.
 
 Each mutation is applied to the source, the suites are run, and the source is
 restored whether they passed, failed or crashed. A mutation no suite catches is

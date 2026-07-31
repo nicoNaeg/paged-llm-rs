@@ -18,14 +18,20 @@ The real Qwen3-0.6B is dumped at the same widths it ships with and its fixture
 is not committed. It is what says the implementation still agrees across 28
 layers, where rounding has had time to accumulate.
 
-Both are dumped in float32, including the real model, whose checkpoint is
-bfloat16. candle has no bf16 matmul on the CPU, so the comparison that isolates
-the implementation from the backend has to run in f32 on both sides. What the
-serving dtype costs is then its own measurement, taken in bf16 on Metal against
-this same f32 reference.
+The real model is dumped twice, and the pair is what makes the claim. In float32
+first, even though its checkpoint is bfloat16: candle has no bf16 matmul on the
+CPU, so the comparison that isolates the implementation from the backend has to
+run in f32 on both sides. Then in bfloat16, so what the serving dtype costs is
+measured against a reference that ran in the same dtype rather than inferred.
+Neither dump alone supports the claim the two make together, and the tolerance
+follows the dtype: 5e-5 in f32, 1e-1 in bf16.
 
-    python scripts/dump_reference.py tiny  crates/pagedllm/tests/fixtures/tiny
-    python scripts/dump_reference.py real  models/Qwen3-0.6B  models/reference
+    python scripts/dump_reference.py tiny crates/pagedllm/tests/fixtures/tiny
+    python scripts/dump_reference.py real models/Qwen3-0.6B models/reference float32
+    python scripts/dump_reference.py real models/Qwen3-0.6B models/reference-bf16 bfloat16
+
+The dtype defaults to float32 when the fourth argument is left off. `make
+reference` runs the last two.
 
 Both write a safetensors file of named activations plus a JSON manifest naming
 the prompt and the relative tolerance the dump was taken at.

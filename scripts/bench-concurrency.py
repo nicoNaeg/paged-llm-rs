@@ -17,6 +17,7 @@ prints the waste that produces.
 
 import json
 import statistics
+import socket
 import subprocess
 import sys
 import time
@@ -82,6 +83,19 @@ def one_request(index: int) -> tuple[float, float, int]:
     return first_at or 0.0, time.time() - started, produced
 
 
+def port_is_free() -> bool:
+    """Nothing must already answer on this port.
+
+    A server left behind by an interrupted run answers `/health` just as well as
+    the one being started, so without this the script measures the survivor and
+    reports it under the new configuration's name. That happened once, to
+    `bench-engines.py`, and cost a whole table.
+    """
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(("127.0.0.1", PORT)) != 0
+
+
 def wait_for_server(process: subprocess.Popen) -> None:
     started = time.time()
     while time.time() - started < 180:
@@ -107,6 +121,8 @@ def main() -> int:
 
 
 def run_layout(block_size: int, attention: str, chunk: str, label: str) -> None:
+    if not port_is_free():
+        raise SystemExit(f"something already answers on port {PORT}")
     process = subprocess.Popen(
         [
             str(BINARY),

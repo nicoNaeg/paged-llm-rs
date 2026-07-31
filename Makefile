@@ -1,4 +1,4 @@
-.PHONY: build server test test-metal test-model smoke bench-chunk bench-concurrency bench-engines bench-prefix profile mutate bench lint fmt venv model model-gguf fixtures reference
+.PHONY: build server test test-metal test-model smoke bench-chunk bench-concurrency bench-engines bench-prefix profile mutate lint fmt venv model model-gguf fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
@@ -31,35 +31,35 @@ test-model:
 	cargo test --release --features metal --test reference_model -- --nocapture
 
 # Drives the server over HTTP, on a process it starts and stops itself, and
-# prints the throughput of one sequence against the contiguous cache.
+# prints what one sequence costs on the server's defaults.
 smoke: build
 	python3 scripts/smoke-server.py
 
 # This engine against the others on this machine, driven by guidellm.
 bench-engines: build
-	$(PYTHON) scripts/bench-engines.py
+	python3 scripts/bench-engines.py
 
 # What a shared prompt buys, and what it costs when nothing is shared.
 bench-prefix: build
-	$(PYTHON) scripts/bench-prefix.py
+	python3 scripts/bench-prefix.py
 
 # A Metal System Trace of a decode under load, written to docs/. Needs a full
 # Xcode, which nothing else here does.
 profile: build
-	$(PYTHON) scripts/profile-gpu.py
+	python3 scripts/profile-gpu.py
 
 # What continuous batching buys against what the reservation costs.
 bench-concurrency: build
 	python3 scripts/bench-concurrency.py
 
-## What a long prompt does to the sequences already generating, with the pass
-## budget on and off.
+# What a long prompt does to the sequences already generating, with the pass
+# budget on and off.
 bench-chunk: build
 	python3 scripts/bench-chunk.py
 
-# Puts each defect the forward-pass tests exist for back, and checks they fail.
-# Adds the full-scale suite when the checkpoint and its reference dumps are
-# there; without them the committed fixture carries it alone.
+# Puts each defect the tests exist for back, and checks they fail. Adds the
+# full-scale suite when the checkpoint and its reference dumps are there;
+# without them the committed fixture carries the model's share alone.
 mutate:
 	@if [ -d "$(MODEL)" ] && [ -d "$(REFERENCE)" ] && [ -d "$(REFERENCE)-bf16" ]; then \
 		PAGEDLLM_MODEL_DIR=$(MODEL) \
@@ -69,9 +69,6 @@ mutate:
 	else \
 		python3 scripts/mutate.py; \
 	fi
-
-bench:
-	cargo bench
 
 lint:
 	cargo fmt --all --check
@@ -95,14 +92,14 @@ model:
 		curl -fsSL -o $$f $(HF)/$$f; \
 	done
 
-# Regenerates the fixture that is committed, so a change to the oracle is a
-# change to the repository rather than to one machine.
 # The same weights in the format llama.cpp reads, for the comparison to be of
 # one model rather than of two.
 model-gguf:
 	mkdir -p $(CURDIR)/models/gguf
 	curl -fsSL -o $(CURDIR)/models/gguf/Qwen3-0.6B-BF16.gguf $(GGUF)
 
+# Regenerates the fixture that is committed, so a change to the oracle is a
+# change to the repository rather than to one machine.
 fixtures:
 	$(PYTHON) scripts/dump_reference.py tiny crates/pagedllm/tests/fixtures/tiny
 
