@@ -7,62 +7,17 @@
 //! one in the head grouping.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use pagedllm::{Config, Model, Trace, Weights};
 
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
-}
+mod common;
+use common::{compare, fixture_dir, load_tiny};
 
 fn reference(dir: &Path) -> HashMap<String, Tensor> {
     candle_core::safetensors::load(dir.join("activations.safetensors"), &Device::Cpu)
         .expect("fixture activations")
-}
-
-fn manifest(dir: &Path) -> serde_json::Value {
-    let text = std::fs::read_to_string(dir.join("manifest.json")).expect("fixture manifest");
-    serde_json::from_str(&text).expect("fixture manifest is json")
-}
-
-/// Largest difference relative to the tensor's own scale, and that scale.
-///
-/// Relative rather than absolute, because activations here span several orders
-/// of magnitude and an absolute threshold would mean something different at
-/// each layer. Floored at one so a tensor of near-zeroes cannot turn a rounding
-/// error into a large ratio.
-fn compare(got: &Tensor, want: &Tensor) -> (f32, f32) {
-    assert_eq!(got.dims(), want.dims(), "shape");
-    let got = got
-        .to_dtype(DType::F32)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-    let want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-    let mut worst = 0f32;
-    let mut scale = 0f32;
-    for (g, w) in got.iter().zip(&want) {
-        worst = worst.max((g - w).abs());
-        scale = scale.max(w.abs());
-    }
-    (worst / scale.max(1.0), scale)
-}
-
-fn load_tiny() -> (Model, Vec<u32>, f64) {
-    let dir = fixture_dir();
-    let manifest = manifest(&dir);
-    let prompt: Vec<u32> = manifest["prompt"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
-        .collect();
-    let tolerance = manifest["relative_tolerance"].as_f64().unwrap();
-    let model = Model::load(&dir, &Device::Cpu).expect("load the tiny model");
-    (model, prompt, tolerance)
 }
 
 #[test]

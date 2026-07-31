@@ -18,7 +18,12 @@ pub fn fixture_dir() -> PathBuf {
 /// layer. Floored at one so a tensor of near-zeroes cannot turn a rounding error
 /// into a large ratio.
 pub fn compare(got: &Tensor, want: &Tensor) -> (f32, f32) {
-    assert_eq!(got.elem_count(), want.elem_count(), "element count");
+    // Shape, not just element count. A reshape that keeps every value in the
+    // same flat order but calls the result a different rectangle produces
+    // identical numbers here, so counting elements would pass it: exactly one
+    // test in the repository caught such a mutation, and only because it
+    // happened to narrow along a dimension afterwards.
+    assert_eq!(got.dims(), want.dims(), "shape");
     let read = |t: &Tensor| -> Vec<f32> {
         t.to_dtype(DType::F32)
             .unwrap()

@@ -247,10 +247,14 @@ fn a_batch_with_no_block_for_its_next_token_is_refused() {
     table.advance(prompt.len()).unwrap();
 
     // The table holds exactly the prompt. Placing one more token without giving
-    // it a block has nowhere to go.
-    if table.blocks_needed(1) > 0 {
-        assert!(Batch::new(vec![1], 1, &[&table], block_size).is_err());
-    }
+    // it a block has nowhere to go. Asserted rather than tested for: the fixture
+    // prompt is a multiple of this block size today, and if it stops being one
+    // the check has to fail loudly instead of quietly not running.
+    assert!(
+        table.blocks_needed(1) > 0,
+        "the prompt no longer fills its last block, so this test checks nothing"
+    );
+    assert!(Batch::new(vec![1], 1, &[&table], block_size).is_err());
     // A row count that does not line up is refused before anything runs.
     assert!(Batch::new(vec![1, 2], 1, &[&table], block_size).is_err());
 }
