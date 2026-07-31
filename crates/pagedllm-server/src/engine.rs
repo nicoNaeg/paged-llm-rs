@@ -274,7 +274,19 @@ fn sample(
         .and_then(|t| t.flatten_all())
         .and_then(|t| t.to_vec1())
         .map_err(|e| e.to_string())?;
-    let vocab = rows.len() / ids.len().max(1);
+    // The pass returns one row of logits per sequence a token is wanted for.
+    // Dividing without checking would not panic, because the quotient is floored
+    // and every slice stays inside the buffer; it would hand each sampler a
+    // window into the wrong row and produce fluent text nobody asked for. Named
+    // here rather than discovered downstream.
+    if !rows.len().is_multiple_of(ids.len()) {
+        return Err(format!(
+            "{} logits for {} sequences, which is not a whole number of rows",
+            rows.len(),
+            ids.len()
+        ));
+    }
+    let vocab = rows.len() / ids.len();
 
     let mut sampled = Vec::with_capacity(ids.len());
     for (row, &id) in ids.iter().enumerate() {
