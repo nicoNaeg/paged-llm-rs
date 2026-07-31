@@ -91,7 +91,7 @@ A test that has never failed is not evidence, so the tests are tested. `scripts/
     rotary halves paired the other way round                               caught     caught
     the MLP gate and up branches swapped                                   caught     caught
 
-Those five are the forward pass's. The full table is 21 mutations across five suites, one per part of the engine, and the shape of the result is the point: no suite catches everything and every mutation is caught by at least one. The forward-pass suites survive every batching defect and the batching suite survives every model defect, because a differential test cannot see a defect that moves both of its sides equally. The table was also run with a suite missing and found three defects nothing was checking, which is how the unit tests came to be in it.
+Those five are the forward pass's. The full table is 22 mutations across five suites, one per part of the engine, and the shape of the result is the point: no suite catches everything and every mutation is caught by at least one. The forward-pass suites survive every batching defect and the batching suite survives every model defect, because a differential test cannot see a defect that moves both of its sides equally. The table was also run with a suite missing and found three defects nothing was checking, which is how the unit tests came to be in it.
 
 It refuses to start on a working tree with uncommitted changes to the files it rewrites, restores them whether the run passed, failed or crashed, and reports a mutation whose anchor has moved as a failure rather than skipping it, since a mutation that no longer applies is one nothing is checking.
 
@@ -573,8 +573,17 @@ test builds its own batches, so it checks that a correct set of positions
 produces correct logits and never that the scheduler produces a correct set: a
 slice restarting its positions at zero survived every suite in the repository.
 What catches it is a scheduler test that reads the positions out of the batch
-directly. Twenty-one mutations now, all caught, and still no suite catching all
+directly. Twenty-two mutations now, all caught, and still no suite catching all
 of them.
+
+The last of those twenty-two came out of reading the tests rather than the code,
+and it is about how they compare. The helper three suites share checked that two
+tensors held the same values and how many, not what shape they were called, so a
+pass whose logits keep every number in the same order and claim a different
+rectangle read as correct. Exactly one test caught it, and only because it
+narrowed along a dimension afterwards. The helper now checks the shape, three
+tests catch it instead of one, and the mutation is in the table so it stays
+caught.
 
 Slicing also has to leave the answer alone, and that was checked rather than
 assumed. In f32 on Metal the same greedy prompt through `--chunk off` and
