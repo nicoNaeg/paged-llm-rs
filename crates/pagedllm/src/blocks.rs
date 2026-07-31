@@ -241,7 +241,12 @@ impl BlockAllocator {
         self.total - self.free.len()
     }
 
-    /// How many unheld blocks still carry a name, which is the cache's size.
+    /// How many blocks carry a name, held or not.
+    ///
+    /// A block keeps its name while the sequence that filled it is still
+    /// reading, which is what lets a second request share a prefix the first has
+    /// not finished with, so this is not the same as the number of blocks free
+    /// to be handed out.
     pub fn cached_blocks(&self) -> usize {
         self.cached.len()
     }
@@ -408,20 +413,6 @@ impl BlockTable {
         Some(block as usize * self.block_size + position % self.block_size)
     }
 
-    /// Every physical slot the sequence occupies, in logical order.
-    ///
-    /// # Panics
-    ///
-    /// If a written position has no block, which `advance` refuses to create.
-    pub fn slots(&self) -> Vec<usize> {
-        (0..self.tokens)
-            .map(|position| {
-                self.slot_of(position)
-                    .expect("a written position has a block")
-            })
-            .collect()
-    }
-
     /// Empty the table and return what it held, for the allocator to take back.
     pub fn take_blocks(&mut self) -> Vec<BlockId> {
         self.tokens = 0;
@@ -483,10 +474,6 @@ mod tests {
         assert_eq!(table.slot_of(4), Some(2 * 4), "the boundary moves it");
         assert_eq!(table.slot_of(9), Some(5 * 4 + 1));
         assert_eq!(table.slot_of(12), None, "past the blocks it holds");
-
-        let slots = table.slots();
-        assert_eq!(slots.len(), 10);
-        assert_eq!(&slots[..5], &[28, 29, 30, 31, 8]);
     }
 
     #[test]
