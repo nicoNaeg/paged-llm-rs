@@ -47,3 +47,29 @@ jobs:
       # kernel. Kernels are checked against their CPU reference in the job above
       # and on real hardware with `make test-metal`.
       - run: cargo clippy --all-targets --features metal -- -D warnings
+
+  # `rust-version` is a promise, and a job on `stable` only ever proves that
+  # stable is new enough. This builds on exactly the version the manifest names,
+  # read from the manifest so the two cannot drift, and on both platforms: the
+  # binding constraint today is candle's NEON path, which only Apple silicon
+  # compiles, and a dependency could raise the other side tomorrow.
+  msrv:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        run: echo "version=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ matrix.os }}
+      # Checking rather than testing: what this answers is whether the declared
+      # version compiles the workspace, and running the suite twice on two
+      # toolchains would pay for an answer the job above already gives.
+      - run: cargo check --workspace --all-targets

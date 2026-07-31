@@ -632,7 +632,7 @@ Kernels are compiled from Metal Shading Language at startup rather than ahead of
 
 ## Development
 
-Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the components.
+Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the components. It also builds on 1.94, which is the oldest version that does and is what `rust-version` names: CI proves it on both platforms rather than leaving the field as a claim, because the constraint is a dependency's use of a NEON intrinsic and only one of the two compiles that path.
 
     make build       release build with the Metal backend
     make server      start the server on port 8000

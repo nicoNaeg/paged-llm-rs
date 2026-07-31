@@ -5,7 +5,7 @@ members = ["crates/pagedllm", "crates/pagedllm-server"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/nicoNaeg/paged-llm-rs"
 authors = ["Nicolas Naegelen"]
