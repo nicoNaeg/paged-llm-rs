@@ -286,7 +286,10 @@ value vectors gives one output dimension to each thread, so the threads of a
 group again read consecutive floats.
 
 The kernel is compiled from Metal Shading Language at startup, so building this
-repository needs no Xcode, and cached per dtype.
+repository needs no Xcode, and cached per dtype. Compiling at startup gives up
+the one real advantage of a `build.rs`, which is that a syntax error stops the
+build, so a test compiles every dtype the kernel claims and `make test-metal`
+fails on a broken kernel rather than a request does.
 
 Three implementations of one function exist, and each pair says something the
 others cannot.

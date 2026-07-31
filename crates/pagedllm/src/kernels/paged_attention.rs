@@ -300,9 +300,10 @@ mod metal {
     /// Compile the kernel for one dtype, once per thread.
     ///
     /// From source at startup rather than ahead of time, so building this
-    /// repository needs no Xcode. A syntax error is caught by the test that
-    /// compiles every kernel, not by a request.
-    fn pipeline(
+    /// repository needs no Xcode. A syntax error is caught by the test below
+    /// that compiles every dtype under `make test-metal`, not by a request. It
+    /// cannot be caught by `cargo test` in CI, which has no Metal device.
+    pub(super) fn pipeline(
         device: &candle_core::MetalDevice,
         dtype: DType,
     ) -> candle_core::Result<ComputePipeline> {
@@ -426,5 +427,48 @@ mod metal {
         drop(encoder);
 
         Ok((MetalStorage::new(out, device, elements, dtype), shape))
+    }
+}
+
+/// The decision to compile the kernel at startup rather than ahead of time was
+/// taken against a `build.rs`, whose one real advantage is that a syntax error
+/// stops the build. What replaces it is this: every dtype the kernel is written
+/// for is compiled here, so a broken kernel fails `make test-metal` rather than
+/// a request. Without it the claim was untrue, since serving only ever compiles
+/// the one dtype it was asked for and no test compiled the others at all.
+///
+/// It cannot run in CI, for the reason everything Metal here cannot: a hosted
+/// macOS runner has no device to compile against.
+#[cfg(feature = "metal")]
+#[cfg(test)]
+mod tests {
+    use candle_core::{DType, Device};
+
+    #[test]
+    fn every_dtype_the_kernel_claims_actually_compiles() {
+        let Ok(device) = Device::new_metal(0) else {
+            eprintln!("skipped: no Metal device");
+            return;
+        };
+        let candle_core::Device::Metal(metal) = &device else {
+            panic!("new_metal returned something else");
+        };
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            super::metal::pipeline(metal, dtype)
+                .unwrap_or_else(|e| panic!("the kernel does not compile for {dtype:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_dtype_the_kernel_is_not_written_for_is_refused_by_name() {
+        let Ok(device) = Device::new_metal(0) else {
+            eprintln!("skipped: no Metal device");
+            return;
+        };
+        let candle_core::Device::Metal(metal) = &device else {
+            panic!("new_metal returned something else");
+        };
+        let refused = super::metal::pipeline(metal, DType::U32);
+        assert!(refused.is_err(), "u32 should have no kernel");
     }
 }

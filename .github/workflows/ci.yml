@@ -20,6 +20,15 @@ jobs:
       # no checkpoint to run against here and says so; captured, it would look
       # like a test that ran.
       - run: cargo test -- --nocapture
+      # The benchmarks and the mutation run are not exercised here: they need a
+      # checkpoint, a GPU, or twenty minutes. A syntax error in one of them is
+      # still invisible until somebody runs it, and that is cheap to rule out.
+      - run: python3 -m compileall -q scripts
+      # Every mutation is a literal excerpt of the source, so a refactor that
+      # moves the line leaves the mutation matching nothing. `make mutate`
+      # reports that as a failure, but only when it is run. This says it in a
+      # second, on every push.
+      - run: python3 scripts/check-mutations.py
 
   metal:
     runs-on: macos-latest
