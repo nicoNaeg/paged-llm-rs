@@ -87,7 +87,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-${{ matrix.os }}
+      # `+version` rather than the installed default, because
+      # `rust-toolchain.toml` overrides the default and rustup says so in the
+      # log: without this the job installs the old toolchain and then checks on
+      # stable, which is green for the wrong reason.
+      #
       # Checking rather than testing: what this answers is whether the declared
       # version compiles the workspace, and running the suite twice on two
       # toolchains would pay for an answer the job above already gives.
-      - run: cargo check --workspace --all-targets ${{ matrix.features }}
+      - name: Report the toolchain actually in use
+        run: cargo +${{ steps.msrv.outputs.version }} --version
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets ${{ matrix.features }}
