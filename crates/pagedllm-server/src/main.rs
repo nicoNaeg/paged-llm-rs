@@ -30,9 +30,11 @@ struct Args {
     /// matmul there.
     #[arg(long, value_enum, default_value_t = Dtype::Auto)]
     dtype: Dtype,
-    /// Refuse to start if the Metal backend was compiled in but is unreachable.
+    /// Refuse to start if a GPU backend was compiled in but is unreachable.
+    /// A build that silently fell back to the CPU would make every later
+    /// measurement a lie, which is the same reason the backend is printed.
     #[arg(long)]
-    require_metal: bool,
+    require_gpu: bool,
     /// Token budget for a request that names none.
     #[arg(long, default_value_t = 512)]
     max_tokens: usize,
@@ -73,8 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let backend = Backend::detect();
-    if args.require_metal && backend == Backend::Cpu {
-        return Err("no Metal device, and --require-metal was given".into());
+    if args.require_gpu && backend == Backend::Cpu {
+        return Err("no GPU device, and --require-gpu was given".into());
     }
     let device = backend.device()?;
     let dtype = match args.dtype {

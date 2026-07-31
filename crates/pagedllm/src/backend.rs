@@ -22,12 +22,19 @@ pub enum Backend {
     /// Apple GPU through Metal.
     #[cfg(feature = "metal")]
     Metal,
+    /// NVIDIA GPU through CUDA.
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
 impl Backend {
     /// The fastest backend this build was compiled for and this machine can
     /// reach, falling back to [`Backend::Cpu`].
     pub fn detect() -> Self {
+        #[cfg(feature = "cuda")]
+        if Device::new_cuda(0).is_ok() {
+            return Self::Cuda;
+        }
         #[cfg(feature = "metal")]
         if Device::new_metal(0).is_ok() {
             return Self::Metal;
@@ -41,6 +48,8 @@ impl Backend {
             Self::Cpu => Ok(Device::Cpu),
             #[cfg(feature = "metal")]
             Self::Metal => Ok(Device::new_metal(0)?),
+            #[cfg(feature = "cuda")]
+            Self::Cuda => Ok(Device::new_cuda(0)?),
         }
     }
 }
@@ -51,6 +60,8 @@ impl fmt::Display for Backend {
             Self::Cpu => f.write_str("cpu"),
             #[cfg(feature = "metal")]
             Self::Metal => f.write_str("metal"),
+            #[cfg(feature = "cuda")]
+            Self::Cuda => f.write_str("cuda"),
         }
     }
 }

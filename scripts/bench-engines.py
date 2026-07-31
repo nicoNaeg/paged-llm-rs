@@ -92,7 +92,7 @@ def engines() -> list[tuple[str, list[str], str, str]]:
                 "--max-batch", str(MAX_SEQUENCES),
                 "--attention", "kernel",
             ],
-            "paged cache, hand-written Metal kernel",
+            "paged cache, hand-written kernel",
             "Qwen3-0.6B",
         ))
     if shutil.which("llama-server") and GGUF.exists():
@@ -129,6 +129,25 @@ def engines() -> list[tuple[str, list[str], str, str]]:
             ],
             "the same safetensors, Metal, paged attention off (see the note)",
             "default",
+        ))
+    # vLLM is the reference implementation of the thing this project rebuilds,
+    # and it only runs on NVIDIA, so this entry never fires on the machine the
+    # rest of the README was measured on. It is the comparison the Metal-only
+    # story could not make: two paged attention implementations, same GPU, same
+    # model, same client.
+    vllm = VENV / "vllm"
+    if vllm.exists():
+        found.append((
+            "vLLM",
+            [
+                str(vllm), "serve", str(MODEL),
+                "--port", str(PORT),
+                "--max-num-seqs", str(MAX_SEQUENCES),
+                "--max-model-len", str(CONTEXT),
+                "--dtype", "bfloat16",
+            ],
+            "the same safetensors, CUDA, its own paged attention",
+            str(MODEL),
         ))
     if ONLY:
         found = [e for e in found if ONLY in e[0]]

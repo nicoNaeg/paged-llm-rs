@@ -225,21 +225,40 @@ fn the_kernel_refuses_a_batch_that_is_not_a_decode() {
     );
 }
 
+/// The GPU this build targets, if there is one to be had.
+///
+/// One helper rather than a Metal test and a CUDA test, because the kernel is a
+/// port of one design and what is being checked is the same claim on both: that
+/// it agrees with the scalar reference. A build with neither backend skips, and
+/// a hosted macOS runner has no device even with the Metal feature on.
+#[cfg(any(feature = "metal", feature = "cuda"))]
+fn accelerator() -> Option<Device> {
+    #[cfg(feature = "cuda")]
+    if let Ok(device) = Device::new_cuda(0) {
+        return Some(device);
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(device) = Device::new_metal(0) {
+        return Some(device);
+    }
+    eprintln!("skipped: no accelerator");
+    None
+}
+
 /// The kernel on the GPU against the tensor path on the GPU.
 ///
 /// This is the comparison the scalar reference cannot make, because it runs the
 /// scalar code rather than the dispatched one. CI cannot make it either:
 /// `MTLCreateSystemDefaultDevice` returns nil inside a hosted macOS runner, so
 /// this only runs under `make test-metal`, on hardware.
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 #[test]
 fn the_kernel_agrees_with_the_tensor_path_on_the_gpu() {
-    let Ok(device) = Device::new_metal(0) else {
-        eprintln!("skipped: no Metal device");
+    let Some(device) = accelerator() else {
         return;
     };
     let (_, prompt, tolerance) = load_tiny();
-    let mut model = Model::load(common::fixture_dir(), &device).expect("load on metal");
+    let mut model = Model::load(common::fixture_dir(), &device).expect("load on the accelerator");
     let prompts: Vec<&[u32]> = vec![&prompt[..5], &prompt[2..], &prompt[..3]];
     let feed = [11u32, 42, 3];
     let block_size = 4;
@@ -265,7 +284,7 @@ fn the_kernel_agrees_with_the_tensor_path_on_the_gpu() {
             }
         }
     }
-    println!("kernel against the tensor path on metal: worst {worst_seen:.3e}");
+    println!("kernel against the tensor path on the GPU: worst {worst_seen:.3e}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -285,15 +304,14 @@ fn the_kernel_agrees_with_the_tensor_path_on_the_gpu() {
 /// crash cannot happen here. The rule the engine follows is that nothing may
 /// touch the result of a pass that asked for nothing, and the check that would
 /// have caught its breaking is over HTTP, in `scripts/smoke-server.py`.
-#[cfg(feature = "metal")]
+#[cfg(any(feature = "metal", feature = "cuda"))]
 #[test]
 fn a_pass_that_asks_for_no_logits_runs_on_the_gpu_and_fills_the_cache() {
-    let Ok(device) = Device::new_metal(0) else {
-        eprintln!("skipped: no Metal device");
+    let Some(device) = accelerator() else {
         return;
     };
     let (_, prompt, tolerance) = load_tiny();
-    let mut model = Model::load(common::fixture_dir(), &device).expect("load on metal");
+    let mut model = Model::load(common::fixture_dir(), &device).expect("load on the accelerator");
     model.set_attention(AttentionKind::Kernel);
     let block_size = 4;
 
@@ -309,7 +327,7 @@ fn a_pass_that_asks_for_no_logits_runs_on_the_gpu_and_fills_the_cache() {
         model.dtype(),
         &device,
     )
-    .expect("a pool on metal");
+    .expect("a pool on the accelerator");
     let mut allocator = BlockAllocator::new(64);
     let mut table = BlockTable::new(block_size);
 

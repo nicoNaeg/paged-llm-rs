@@ -23,6 +23,10 @@ tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-
 # The Apple GPU path. Off by default so the crate builds and tests on any
 # machine, which is what CI runs: GitHub's macOS runners have no Metal device.
 metal = ["candle-core/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
+# The NVIDIA path. Compiled and checked on an RTX 4090, against the same scalar
+# reference the Metal path is checked against; `docs/cuda-port.md` carries the
+# numbers and what porting it said about the Metal one.
+cuda = ["candle-core/cuda"]
 
 [lints]
 workspace = true

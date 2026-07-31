@@ -35,6 +35,13 @@ attention kernel and the CPU implementation that is its oracle, the batching
 policy, the prefix cache, the sampler, and the Qwen3 forward pass. **Taken from
 candle**: tensors, safetensors loading, and matrix multiplication.
 
+**The kernel runs on NVIDIA too**, ported to CUDA and checked on an RTX 4090
+against the same oracle, to 5.960e-8. That port is worth reading for what it says
+about the table above rather than for the backend: on CUDA the hand-written
+kernel buys 21 % at one client and **nothing at sixty-four**, where here it buys
+4.1 times. The 4.1 was measuring candle's Metal gather, not paged attention.
+[docs/cuda-port.md](docs/cuda-port.md) has the numbers.
+
 **Contents.** [Design](#design) and [architecture](#architecture) first, then one
 section per stage in the order they were built: [the forward
 pass](#the-forward-pass-and-how-it-is-known-to-be-right), [the
