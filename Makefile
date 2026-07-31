@@ -1,4 +1,4 @@
-.PHONY: build server test test-metal test-model smoke bench-chunk bench-concurrency bench-engines bench-prefix profile mutate lint fmt venv model model-gguf fixtures reference
+.PHONY: build server test test-metal test-model smoke demo bench-chunk bench-concurrency bench-engines bench-prefix profile mutate lint fmt venv model model-gguf fixtures reference
 
 MODEL     ?= $(CURDIR)/models/Qwen3-0.6B
 REFERENCE ?= $(CURDIR)/models/reference
@@ -51,6 +51,11 @@ profile: build
 # What continuous batching buys against what the reservation costs.
 bench-concurrency: build
 	python3 scripts/bench-concurrency.py
+
+# Four clients streaming while a long prompt arrives, drawn as it happens. This
+# is what `docs/demo.gif` records; it measures nothing bench-chunk does not.
+demo: build
+	python3 scripts/demo.py
 
 # What a long prompt does to the sequences already generating, with the pass
 # budget on and off.

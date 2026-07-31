@@ -2,6 +2,14 @@
 
 > LLM inference engine in Rust, served over the OpenAI API. Paged KV cache, continuous batching, attention kernels written in Metal Shading Language for Apple GPUs.
 
+![Four clients streaming while a prompt of eight hundred words arrives, none of them stopping](docs/demo.gif)
+
+Four clients streaming when somebody else's eight-hundred-word prompt arrives.
+None of them stops, because that prompt is fed a slice per pass instead of taking
+a pass to itself. `make demo` runs it, and `python3 scripts/demo.py --chunk off`
+runs the same thing with the budget turned off, which stalls every client for a
+second.
+
 **All eight stages built.** Every number here comes from a committed benchmark,
 with the command that produces it, on one machine: an Apple M4 Pro running
 Qwen3-0.6B in bfloat16.
@@ -691,6 +699,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make test        the CPU path, which is what CI runs
     make test-metal  adds the tests that need a Metal device, the kernel among them
     make smoke       drive the server over HTTP and print its throughput
+    make demo        four clients streaming while a long prompt arrives
     make bench-concurrency   what batching buys and what the reservation costs
     make bench-engines       against llama.cpp and mistral.rs, driven by guidellm
     make bench-prefix        what a shared prompt buys, and what it costs without one
