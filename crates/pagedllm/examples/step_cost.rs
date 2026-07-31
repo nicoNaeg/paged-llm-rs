@@ -2,8 +2,11 @@
 //!
 //! A decode step reads every weight of the model once, whatever the batch, so
 //! its cost should be nearly flat in the number of rows. Stage 3 measured that
-//! it is not, and did not find out why. This is where that question came from,
-//! kept so an answer has something to be checked against.
+//! it was not and did not find out why, and this is where that question came
+//! from. It has since been answered and the answer was the gather: the tensor
+//! path copies every resident sequence's keys and values into one rectangle per
+//! layer per step, which is proportional to the batch and cancels what batching
+//! buys. The comparison stays because it is what shows the kernel removing it.
 //!
 //! It runs at two block sizes. A block as wide as the context is one block a
 //! sequence, which is the reservation stage 3 measured; a block of sixteen is
