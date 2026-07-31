@@ -180,8 +180,11 @@ impl Model {
         let mut blocks = Vec::with_capacity(config.num_hidden_layers);
         for layer in 0..config.num_hidden_layers {
             let p = format!("model.layers.{layer}");
+            let raw = |name: &str, out: usize, inp: usize| -> Result<Tensor> {
+                weights.get(&format!("{p}.{name}.weight"), &[out, inp])
+            };
             let linear = |name: &str, out: usize, inp: usize| -> Result<Linear> {
-                Linear::new(&weights.get(&format!("{p}.{name}.weight"), &[out, inp])?)
+                Linear::new(&raw(name, out, inp)?)
             };
             let norm = |name: &str, width: usize| -> Result<RmsNorm> {
                 Ok(RmsNorm::new(
@@ -192,9 +195,11 @@ impl Model {
             blocks.push(Block {
                 input_layernorm: norm("input_layernorm", hidden)?,
                 self_attn: Attention::new(
-                    linear("self_attn.q_proj", config.query_width(), hidden)?,
-                    linear("self_attn.k_proj", config.kv_width(), hidden)?,
-                    linear("self_attn.v_proj", config.kv_width(), hidden)?,
+                    // Q, K and V read the same input, so they are stacked into
+                    // one multiply at load time rather than three per token.
+                    &raw("self_attn.q_proj", config.query_width(), hidden)?,
+                    &raw("self_attn.k_proj", config.kv_width(), hidden)?,
+                    &raw("self_attn.v_proj", config.kv_width(), hidden)?,
                     linear("self_attn.o_proj", hidden, config.query_width())?,
                     // Both norms are as wide as one head, not as wide as the
                     // concatenated heads. That is what says they run after the
@@ -204,13 +209,13 @@ impl Model {
                     config.num_attention_heads,
                     config.num_key_value_heads,
                     config.head_dim,
-                ),
+                )?,
                 post_attention_layernorm: norm("post_attention_layernorm", hidden)?,
                 mlp: Mlp::new(
-                    linear("mlp.gate_proj", config.intermediate_size, hidden)?,
-                    linear("mlp.up_proj", config.intermediate_size, hidden)?,
+                    &raw("mlp.gate_proj", config.intermediate_size, hidden)?,
+                    &raw("mlp.up_proj", config.intermediate_size, hidden)?,
                     linear("mlp.down_proj", hidden, config.intermediate_size)?,
-                ),
+                )?,
             });
         }
 
