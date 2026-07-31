@@ -53,6 +53,7 @@ KERNEL = ROOT / "crates/pagedllm/src/kernels/paged_attention.rs"
 BLOCKS = ROOT / "crates/pagedllm/src/blocks.rs"
 MSL = ROOT / "crates/pagedllm/src/kernels/paged_attention.metal"
 SCHEDULER = ROOT / "crates/pagedllm/src/scheduler.rs"
+MODEL = ROOT / "crates/pagedllm/src/model/mod.rs"
 
 # (what the mistake is, file, the code as written, the code with the defect)
 MUTATIONS = [
@@ -189,6 +190,12 @@ MUTATIONS = [
         SCHEDULER,
         "            rows.push((index, done + offset));",
         "            rows.push((index, offset));",
+    ),
+    (
+        "the logits of a pass shaped as their own transpose",
+        MODEL,
+        "        Ok(logits.reshape((batch.logit_rows.len(), ()))?)",
+        "        Ok(logits.reshape(((), batch.logit_rows.len()))?)",
     ),
 ]
 
