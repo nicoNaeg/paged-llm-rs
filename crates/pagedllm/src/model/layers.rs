@@ -35,65 +35,6 @@ impl Linear {
     }
 }
 
-/// Several projections of the same input, multiplied as one.
-///
-/// Q, K and V all read the layer's input, and so do the MLP's gate and up. Run
-/// separately that is one dispatch each, and on a decode step a dispatch is what
-/// costs: the profile under `docs/` puts a step at about 150 command buffer
-/// submissions against a bandwidth floor of 5.5 ms, so what is left to win is
-/// the number of times work is handed to the GPU rather than the work itself.
-///
-/// Stacking the weights along their output dimension turns those into one
-/// multiply whose result is the pieces laid end to end, which `split` hands back
-/// as views. Whether that is faster is measured rather than assumed, by
-/// `cargo run --release --features metal --example step_cost`.
-#[derive(Debug)]
-pub struct Fused {
-    weight_t: Tensor,
-    widths: Vec<usize>,
-}
-
-impl Fused {
-    /// Stack projections given in the layout safetensors stores, `[out, in]`.
-    ///
-    /// # Errors
-    ///
-    /// If the weights disagree about their input width, which means they were
-    /// not all reading the same thing and had no business being fused.
-    pub fn new(weights: &[&Tensor]) -> Result<Self> {
-        let widths = weights
-            .iter()
-            .map(|w| Ok(w.dim(0)?))
-            .collect::<Result<Vec<_>>>()?;
-        let stacked = Tensor::cat(weights, 0)?;
-        Ok(Self {
-            weight_t: stacked.t()?.contiguous()?,
-            widths,
-        })
-    }
-
-    /// Multiply once and hand back one piece per weight that was stacked.
-    ///
-    /// The pieces are narrows of the result, so nothing is copied here. What
-    /// reads them decides whether it needs a contiguous tensor, which is where
-    /// the cost of splitting shows up if it shows up at all.
-    pub fn forward(&self, x: &Tensor) -> Result<Vec<Tensor>> {
-        let dims = x.dims();
-        let in_features = dims[dims.len() - 1];
-        let y = x.reshape(((), in_features))?.matmul(&self.weight_t)?;
-
-        let mut pieces = Vec::with_capacity(self.widths.len());
-        let mut at = 0;
-        for &width in &self.widths {
-            let mut out_dims = dims.to_vec();
-            out_dims[dims.len() - 1] = width;
-            pieces.push(y.narrow(1, at, width)?.reshape(out_dims)?);
-            at += width;
-        }
-        Ok(pieces)
-    }
-}
-
 /// Root mean square normalisation over the last dimension.
 #[derive(Debug)]
 pub struct RmsNorm {
@@ -129,22 +70,19 @@ impl RmsNorm {
 #[allow(clippy::struct_field_names)]
 #[derive(Debug)]
 pub struct Mlp {
-    /// Gate and up stacked: both read `x`, so they are one multiply.
-    gate_up: Fused,
+    gate_proj: Linear,
+    up_proj: Linear,
     down_proj: Linear,
 }
 
 impl Mlp {
-    /// Assemble from the three projections, stacking the two that share input.
-    ///
-    /// # Errors
-    ///
-    /// If gate and up disagree about their input width.
-    pub fn new(gate_proj: &Tensor, up_proj: &Tensor, down_proj: Linear) -> Result<Self> {
-        Ok(Self {
-            gate_up: Fused::new(&[gate_proj, up_proj])?,
+    /// Assemble from the three projections.
+    pub fn new(gate_proj: Linear, up_proj: Linear, down_proj: Linear) -> Self {
+        Self {
+            gate_proj,
+            up_proj,
             down_proj,
-        })
+        }
     }
 
     /// `down(silu(gate(x)) * up(x))`.
@@ -153,10 +91,10 @@ impl Mlp {
     /// swapping them produces a network that trains and generates fluent text
     /// while disagreeing with the checkpoint it loaded.
     pub fn forward(&self, x: &Tensor, trace: &mut super::Trace, prefix: &str) -> Result<Tensor> {
-        let pieces = self.gate_up.forward(x)?;
-        let (gate, up) = (&pieces[0], &pieces[1]);
-        trace.record(&format!("{prefix}.gate_proj.out"), gate);
-        trace.record(&format!("{prefix}.up_proj.out"), up);
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        trace.record(&format!("{prefix}.gate_proj.out"), &gate);
+        trace.record(&format!("{prefix}.up_proj.out"), &up);
 
         let gated = (gate.silu()? * up)?;
         trace.record(&format!("{prefix}.down_proj.in"), &gated);

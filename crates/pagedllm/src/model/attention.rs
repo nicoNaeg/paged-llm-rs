@@ -3,7 +3,7 @@
 use candle_core::{D, DType, Tensor};
 
 use super::Trace;
-use super::layers::{Fused, Linear, RmsNorm};
+use super::layers::{Linear, RmsNorm};
 use super::rope::Rope;
 use crate::Result;
 use crate::batch::{Batch, PagedCache};
@@ -12,9 +12,9 @@ use crate::kernels::{AttentionKind, PagedAttention};
 /// One attention block.
 #[derive(Debug)]
 pub struct Attention {
-    /// Q, K and V stacked: all three read the layer's input, so they are one
-    /// multiply whose result is the three laid end to end.
-    qkv: Fused,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -26,24 +26,22 @@ pub struct Attention {
 
 impl Attention {
     /// Assemble from the projections, the two head norms and the head counts.
-    ///
-    /// # Errors
-    ///
-    /// If the three stacked projections disagree about their input width.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        q_proj: &Tensor,
-        k_proj: &Tensor,
-        v_proj: &Tensor,
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
         o_proj: Linear,
         q_norm: RmsNorm,
         k_norm: RmsNorm,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Result<Self> {
-        Ok(Self {
-            qkv: Fused::new(&[q_proj, k_proj, v_proj])?,
+    ) -> Self {
+        Self {
+            q_proj,
+            k_proj,
+            v_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -51,7 +49,7 @@ impl Attention {
             num_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
-        })
+        }
     }
 
     /// Attend over `x`, shaped `[batch, seq, hidden]`.
@@ -71,14 +69,16 @@ impl Attention {
     ) -> Result<Tensor> {
         let (batch, seq, _) = x.dims3()?;
 
-        let qkv = self.qkv.forward(x)?;
-        trace.record(&format!("{prefix}.q_proj.out"), &qkv[0]);
-        trace.record(&format!("{prefix}.k_proj.out"), &qkv[1]);
-        trace.record(&format!("{prefix}.v_proj.out"), &qkv[2]);
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+        trace.record(&format!("{prefix}.q_proj.out"), &q);
+        trace.record(&format!("{prefix}.k_proj.out"), &k);
+        trace.record(&format!("{prefix}.v_proj.out"), &v);
 
-        let q = qkv[0].reshape((batch, seq, self.num_heads, self.head_dim))?;
-        let k = qkv[1].reshape((batch, seq, self.num_kv_heads, self.head_dim))?;
-        let v = qkv[2].reshape((batch, seq, self.num_kv_heads, self.head_dim))?;
+        let q = q.reshape((batch, seq, self.num_heads, self.head_dim))?;
+        let k = k.reshape((batch, seq, self.num_kv_heads, self.head_dim))?;
+        let v = v.reshape((batch, seq, self.num_kv_heads, self.head_dim))?;
 
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
@@ -132,10 +132,18 @@ impl Attention {
     ) -> Result<Tensor> {
         let (rows, seq, _) = x.dims3()?;
 
-        let qkv = self.qkv.forward(x)?;
-        let q = qkv[0].reshape((rows, seq, self.num_heads, self.head_dim))?;
-        let k = qkv[1].reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
-        let v = qkv[2].reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_heads, self.head_dim))?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((rows, seq, self.num_kv_heads, self.head_dim))?;
 
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?.contiguous()?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?.contiguous()?;

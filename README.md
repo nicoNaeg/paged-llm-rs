@@ -425,9 +425,26 @@ account for.
 That is the shape of the remaining gap, and it is not in the attention any more.
 Stage 5 removed the copy that made batching pointless; what is left is the
 granularity at which candle hands work to the GPU, which no kernel written here
-can change. Fusing a layer's projections into fewer dispatches is the next thing
-a measurement would ask for, and it is a change to how the model calls candle
-rather than to the kernel.
+can change.
+
+**Fusing a layer's projections was the obvious next move, and it was measured and
+rejected.** Q, K and V read the same input and so do the MLP's gate and up, so
+each group can be one multiply over stacked weights instead of three and two. It
+made a decode step slower: 24.83 ms against 24.16 at one row and 61.57 against
+60.87 at thirty-two, where two runs of the unfused build agreed to 0.02 ms. The
+reason is the split. Stacking saves three dispatches and narrowing the result
+back into three tensors costs three copies, because a narrow along the last
+dimension is strided and the reshape that follows has to make it contiguous. The
+commit that did it and the revert that undid it are both in the history, so the
+measurement can be repeated rather than believed.
+
+That result comes with a caveat about the count above, and the caveat is the more
+useful half. Three runs of the same unfused build measured 117, 126 and 183
+command buffers a step. The count is one run of a noisy instrument, and it is
+solid enough to say a step is made of many submissions rather than a few, which
+is the claim it is used for; it is not solid enough to tell two builds apart. So
+what rejects the fusion is the step time, which is stable, and not the submission
+count, which is not.
 
 One caveat the summary states rather than hides: recording slows the process it
 records, so the tokens a second inside the trace are well under what the same
