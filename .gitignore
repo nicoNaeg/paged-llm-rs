@@ -10,8 +10,6 @@
 # Benchmark and profiler output
 /bench-results/
 *.trace
-*.stacks
-/flamegraph.svg
 
 # OS
 .DS_Store
