@@ -156,6 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         per_token.bytes_per_token(dtype_for_pool),
         pool.blocks * pool.block_size
     );
+    println!(
+        "  context  {} tokens a sequence at most, prompt and output together",
+        engine.max_context()
+    );
 
     let state = AppState {
         engine,

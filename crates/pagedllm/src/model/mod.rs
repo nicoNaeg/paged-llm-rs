@@ -365,6 +365,19 @@ impl Model {
         self.attention
     }
 
+    /// The longest sequence one row can reach: the rotary table's length, and
+    /// the kernel's cap on this device when the kernel is what decodes.
+    pub fn max_context(&self, block_size: usize) -> usize {
+        let kernel = match self.attention {
+            AttentionKind::Kernel => {
+                crate::kernels::paged_attention::max_context(&self.device, block_size)
+            }
+            AttentionKind::Tensor => None,
+        };
+        let positions = self.config.max_position_embeddings;
+        kernel.map_or(positions, |cap| cap.min(positions))
+    }
+
     /// The architecture this model was loaded at.
     pub fn config(&self) -> &Config {
         &self.config

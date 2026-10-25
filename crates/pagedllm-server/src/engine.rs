@@ -72,6 +72,7 @@ pub struct Engine {
     model_id: String,
     pool: PoolConfig,
     cache_bytes: usize,
+    max_context: usize,
 }
 
 impl Engine {
@@ -88,7 +89,7 @@ impl Engine {
             .map_or_else(|| "model".to_string(), |n| n.to_string_lossy().into_owned());
 
         let (jobs, inbox) = mpsc::unbounded_channel::<Job>();
-        let (ready, loaded) = oneshot::channel::<Result<usize, String>>();
+        let (ready, loaded) = oneshot::channel::<Result<(usize, usize), String>>();
         let thread_tokenizer = Arc::clone(&tokenizer);
 
         std::thread::Builder::new()
@@ -109,17 +110,20 @@ impl Engine {
                     let bytes = cache_config.bytes(model.dtype());
                     let cache = PagedCache::new(cache_config, model.dtype(), &device)
                         .map_err(|e| e.to_string())?;
-                    Ok::<_, String>((model, cache, bytes))
+                    let max_context = model
+                        .max_context(pool.block_size)
+                        .min(pool.blocks * pool.block_size);
+                    Ok::<_, String>((model, cache, bytes, max_context))
                 })();
 
-                let (model, cache, bytes) = match started {
+                let (model, cache, bytes, max_context) = match started {
                     Ok(parts) => parts,
                     Err(e) => {
                         let _ = ready.send(Err(e));
                         return;
                     }
                 };
-                let _ = ready.send(Ok(bytes));
+                let _ = ready.send(Ok((bytes, max_context)));
                 let mut scheduler = Scheduler::new(pool.blocks, pool.block_size, pool.max_batch);
                 scheduler.set_prefix_cache(pool.prefix_cache);
                 scheduler.set_chunk(pool.chunk);
@@ -127,7 +131,7 @@ impl Engine {
             })
             .map_err(|e| format!("starting the engine thread: {e}"))?;
 
-        let cache_bytes = loaded
+        let (cache_bytes, max_context) = loaded
             .await
             .map_err(|_| "the engine thread stopped while loading".to_string())??;
 
@@ -137,6 +141,7 @@ impl Engine {
             model_id,
             pool,
             cache_bytes,
+            max_context,
         })
     }
 
@@ -167,6 +172,13 @@ impl Engine {
     /// What the pool cost to allocate.
     pub fn cache_bytes(&self) -> usize {
         self.cache_bytes
+    }
+
+    /// The most tokens one sequence may reach, prompt and output together:
+    /// the model's rotary table, the kernel's cap on this device, and the pool,
+    /// whichever is smallest.
+    pub fn max_context(&self) -> usize {
+        self.max_context
     }
 }
 
@@ -210,7 +222,7 @@ fn run(
             Some(batch) => match sample(model, cache, &mut scheduler, batch, &ids) {
                 Ok(tokens) => tokens,
                 Err(e) => {
-                    fail(&mut scheduler, &mut clients, &ids, &e);
+                    fail(&mut scheduler, &mut clients, &plan, &e);
                     continue;
                 }
             },
@@ -337,12 +349,10 @@ fn admit(
 
 /// A failed pass takes down every sequence that was in it, because none of them
 /// can tell whether their slot was written before it stopped.
-fn fail(scheduler: &mut Scheduler, clients: &mut HashMap<u64, Client>, ids: &[u64], message: &str) {
-    for &id in ids {
+fn fail(scheduler: &mut Scheduler, clients: &mut HashMap<u64, Client>, plan: &Plan, message: &str) {
+    for id in scheduler.abort(plan) {
         if let Some(client) = clients.remove(&id) {
             let _ = client.events.send(Event::Failed(message.to_string()));
         }
-        scheduler.cancel(id);
     }
-    scheduler.drain_finished();
 }

@@ -228,6 +228,16 @@ def main() -> int:
         )
         check("accepts the defaults a client sends anyway", status == 200)
 
+        # A prompt longer than one sequence can hold, which is past the kernel's
+        # limit on the defaults. It used to be accepted and sliced until the
+        # kernel refused a slice part way, and the failed slice was rebuilt on
+        # every pass after that, holding the engine thread for good.
+        status, out, _ = call("/v1/completions", {"prompt": "hello " * 9000, "max_tokens": 8})
+        message = out.get("error", {}).get("message", "") if status != 200 else ""
+        check("refuses a prompt past what one sequence holds", status == 400, message)
+        status, _, _ = call("/v1/completions", {"prompt": "Hello", "max_tokens": 4})
+        check("and still serves the next request", status == 200)
+
         # A prompt longer than the pass budget, arriving with nothing else
         # running, so its first slices go through the model asking for no logits
         # at all. That is the only shape where a pass produces an empty result,

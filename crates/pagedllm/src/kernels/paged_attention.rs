@@ -6,7 +6,7 @@
 //! are.
 
 use candle_core::backend::BackendStorage;
-use candle_core::{CpuStorage, DType, Layout, Shape, Tensor};
+use candle_core::{CpuStorage, DType, Device, Layout, Shape, Tensor};
 
 use crate::batch::Batch;
 use crate::{Error, Result};
@@ -49,8 +49,33 @@ impl std::str::FromStr for AttentionKind {
 /// reduction halves it, and a multiple of the 32 lanes both a SIMD group and a
 /// warp are made of. Shared by both backends, which is one reason they are a
 /// port of each other rather than two designs.
-#[cfg(any(feature = "metal", feature = "cuda"))]
 const THREADS: usize = 128;
+
+/// On-chip memory one threadgroup gets on Metal, and one block's dynamic shared
+/// memory on CUDA without opting in to more.
+const METAL_SHARED: usize = 32 << 10;
+const CUDA_SHARED: usize = 48 << 10;
+
+/// The longest context the kernel decodes on `device`, or `None` where nothing
+/// caps it, which is the CPU's scalar reference.
+///
+/// The scores live in on-chip memory, one float per position of the longest
+/// row's blocks, beside one float of reduction scratch per thread. This is what
+/// the server refuses a request against, so a sequence that would outgrow the
+/// kernel is turned away at the door instead of failing part way through. An
+/// online softmax is what removes the cap.
+pub fn max_context(device: &Device, block_size: usize) -> Option<usize> {
+    let shared = if device.is_metal() {
+        METAL_SHARED
+    } else if device.is_cuda() {
+        CUDA_SHARED
+    } else {
+        return None;
+    };
+    let block_size = block_size.max(1);
+    let positions = shared / std::mem::size_of::<f32>() - THREADS;
+    Some(positions / block_size * block_size)
+}
 
 /// One decode step's attention, read through a block table.
 ///
@@ -270,7 +295,7 @@ mod metal {
     use candle_metal_kernels::utils::set_param;
     use objc2_metal::MTLSize;
 
-    use super::{PagedAttention, THREADS};
+    use super::{METAL_SHARED, PagedAttention, THREADS};
 
     /// The parameters the kernel reads, laid out as the MSL struct expects.
     #[repr(C)]
@@ -396,7 +421,7 @@ mod metal {
         // the occupancy that reservation buys nothing for.
         let longest = op.max_blocks * op.block_size;
         let scores_bytes = longest * std::mem::size_of::<f32>();
-        let limit = 32 << 10;
+        let limit = METAL_SHARED;
         if scores_bytes + THREADS * std::mem::size_of::<f32>() > limit {
             candle_core::bail!(
                 "a context of {longest} needs {scores_bytes} bytes of threadgroup memory, past the {limit} available; \
@@ -534,7 +559,7 @@ mod cuda {
     use candle_core::{CudaStorage, DType, Layout, Shape, Storage, Tensor};
     use cudarc::driver::{CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 
-    use super::{PagedAttention, THREADS};
+    use super::{CUDA_SHARED, PagedAttention, THREADS};
 
     thread_local! {
         /// The compiled PTX, keyed by the dtype it was built for. candle caches
@@ -625,7 +650,7 @@ mod cuda {
         // not reserve what a long one would need.
         let longest = op.max_blocks * op.block_size;
         let shared = (longest + THREADS) * std::mem::size_of::<f32>();
-        let limit = 48 << 10;
+        let limit = CUDA_SHARED;
         if shared > limit {
             candle_core::bail!(
                 "a context of {longest} needs {shared} bytes of shared memory, past the {limit} available; \

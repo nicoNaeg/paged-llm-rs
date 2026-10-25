@@ -192,6 +192,12 @@ MUTATIONS = [
         "            rows.push((index, offset));",
     ),
     (
+        "a failed pass taking down only the sequences it sampled for",
+        SCHEDULER,
+        "        let ids: Vec<u64> = plan.advanced().into_iter().map(|(id, _)| id).collect();",
+        "        let ids: Vec<u64> = plan.ids().to_vec();",
+    ),
+    (
         "the logits of a pass shaped as their own transpose",
         MODEL,
         "        Ok(logits.reshape((batch.logit_rows.len(), ()))?)",

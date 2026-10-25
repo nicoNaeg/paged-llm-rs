@@ -778,6 +778,21 @@ impl Scheduler {
         self.retire(&mut outcome);
     }
 
+    /// Take down every sequence a failed pass wrote to, and say which they were.
+    ///
+    /// That is more than `plan.ids()`, which names the sequences a token comes
+    /// back for. A prompt in the middle of its slices asks for none, so it is
+    /// not among them, and left running it rebuilt the same failing pass on
+    /// every plan from then on: one prompt past the kernel's limit held the
+    /// engine thread for good.
+    pub fn abort(&mut self, plan: &Plan) -> Vec<u64> {
+        let ids: Vec<u64> = plan.advanced().into_iter().map(|(id, _)| id).collect();
+        for &id in &ids {
+            self.cancel(id);
+        }
+        ids
+    }
+
     /// Hand every finished sequence's blocks back to the pool.
     fn retire(&mut self, outcome: &mut Outcome) {
         let mut index = 0;
@@ -790,13 +805,6 @@ impl Scheduler {
             self.pool.free_table(&mut sequence.table);
             outcome.finished.push((sequence.id, finish));
         }
-    }
-
-    /// Sequences that finished without a pass running.
-    pub fn drain_finished(&mut self) -> Outcome {
-        let mut outcome = Outcome::default();
-        self.retire(&mut outcome);
-        outcome
     }
 }
 
@@ -963,6 +971,27 @@ mod tests {
         assert_eq!(outcome.finished, vec![(1, Finish::Length)]);
         assert_eq!(scheduler.waiting(), 0);
         assert_eq!(scheduler.pool().available(), 2, "no block was consumed");
+    }
+
+    #[test]
+    fn a_failed_slice_takes_its_prompt_with_it() {
+        let mut scheduler = scheduler(64, 4, 4);
+        scheduler.set_chunk(Some(4));
+        scheduler.submit(sequence(1, 12, 10));
+        scheduler.submit(sequence(2, 3, 10));
+
+        let plan = scheduler.plan();
+        assert!(matches!(plan, Plan::Mixed { .. }));
+        assert!(plan.ids().is_empty(), "a first slice asks for no token");
+        assert_eq!(scheduler.abort(&plan), vec![1]);
+
+        // The next pass is the next prompt, not the same slice again.
+        let (plan, _) = step(&mut scheduler, 5);
+        let Plan::Mixed { advanced, .. } = &plan else {
+            panic!("expected the second prompt, got {plan:?}");
+        };
+        assert_eq!(advanced, &vec![(2, 3)]);
+        assert_eq!(scheduler.running_ids(), vec![2]);
     }
 
     #[test]

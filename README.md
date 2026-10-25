@@ -141,7 +141,7 @@ A test that has never failed is not evidence, so the tests are tested. `scripts/
     rotary halves paired the other way round                               caught     caught
     the MLP gate and up branches swapped                                   caught     caught
 
-Those five are the forward pass's. The full table is 22 mutations across five suites, one per part of the engine, and the shape of the result is the point: no suite catches everything and every mutation is caught by at least one. The forward-pass suites survive every batching defect and the batching suite survives every model defect, because a differential test cannot see a defect that moves both of its sides equally. The table was also run with a suite missing and found three defects nothing was checking, which is how the unit tests came to be in it.
+Those five are the forward pass's. The full table is 23 mutations across five suites, one per part of the engine, and the shape of the result is the point: no suite catches everything and every mutation is caught by at least one. The forward-pass suites survive every batching defect and the batching suite survives every model defect, because a differential test cannot see a defect that moves both of its sides equally. The table was also run with a suite missing and found three defects nothing was checking, which is how the unit tests came to be in it.
 
 It refuses to start on a working tree with uncommitted changes to the files it rewrites, restores them whether the run passed, failed or crashed, and reports a mutation whose anchor has moved as a failure rather than skipping it, since a mutation that no longer applies is one nothing is checking.
 
@@ -166,6 +166,8 @@ $ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d
 ### What is refused, and why that is the feature
 
 `temperature`, `top_p`, `top_k`, `max_tokens`, `seed` and `stream` are honoured. Everything else the schema allows is parsed in order to be refused with a 400 naming it: `n` above one, `stop`, `tools`, `logit_bias`, `logprobs`, `response_format` and the two penalties. A server that accepts `frequency_penalty` and ignores it answers a different question than it was asked, and the client has no way to find out. What a client sends meaning "default" gets through, so `n: 1` and a penalty of zero are not refusals.
+
+A request whose prompt and `max_tokens` together exceed what one sequence can hold is refused the same way, and one that names no `max_tokens` gets the default cut to what fits. The limit is the smallest of the model's rotary table, the kernel's threadgroup memory on the device (8064 tokens on Metal at a block size of 16) and the pool, and the server prints it at startup.
 
 The sampling defaults come from the model's own `generation_config.json`, which for Qwen3 is temperature 0.6, top-p 0.95 and top-k 20, and the server prints them at startup. A request that names a parameter still wins. Serving at the `OpenAI` default of temperature 1 instead would answer a noticeably different question than the model was tuned for.
 
@@ -654,6 +656,23 @@ rectangle read as correct. Exactly one test caught it, and only because it
 narrowed along a dimension afterwards. The helper now checks the shape, three
 tests catch it instead of one, and the mutation is in the table so it stays
 caught.
+
+A third came out of reading the code well after this stage landed, and it is the
+worst of the three because it took the whole server down. The kernel keeps its
+scores in threadgroup memory, which caps a row at 8064 tokens on Metal at a
+block size of 16, and it refuses past that rather than overflowing. Nothing
+upstream knew the cap. A longer prompt was accepted and sliced, and the slice
+that crossed the limit failed. The failure path took down the sequences the pass
+had asked a token for, and a prompt in the middle of its slices asks for none,
+so it stayed running and the next plan rebuilt the same failing slice, forever.
+One request of 8300 tokens held the engine thread, and no request after it was
+ever admitted. Each half has its fix. The server refuses with a 400 any request
+that could outgrow one sequence, against the limit given under what is
+refused, and a failed pass takes down every sequence it wrote to rather than
+only those it sampled for. A scheduler test fails a first slice and requires the
+next pass to be the next prompt; putting the old behaviour back is the
+twenty-third mutation; and a GPU test runs the longest context the kernel
+advertises and requires one token more to be refused.
 
 Slicing also has to leave the answer alone, and that was checked rather than
 assumed. In f32 on Metal the same greedy prompt through `--chunk off` and

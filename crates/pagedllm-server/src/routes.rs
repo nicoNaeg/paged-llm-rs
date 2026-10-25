@@ -102,6 +102,28 @@ fn finish_name(finish: Finish) -> &'static str {
     }
 }
 
+/// How many tokens a request may produce, or why it cannot run at all.
+///
+/// A limit the request names is honoured or refused, never shortened; one that
+/// names none gets the server's default cut to what fits. Checked before the
+/// engine sees it, because a sequence that outgrows the kernel, the rotary table
+/// or the pool fails part way through, after its client has waited for it.
+fn budget(state: &AppState, prompt: usize, asked: Option<usize>) -> Result<usize, String> {
+    let limit = state.engine.max_context();
+    let room = limit.saturating_sub(prompt);
+    match asked {
+        _ if room == 0 => Err(format!(
+            "the prompt is {prompt} tokens, and one sequence holds at most {limit} here"
+        )),
+        Some(n) if n > room => Err(format!(
+            "max_tokens is {n}, and a prompt of {prompt} tokens leaves room for {room} \
+             of the {limit} one sequence holds here"
+        )),
+        Some(n) => Ok(n),
+        None => Ok(state.default_max_tokens.min(room)),
+    }
+}
+
 /// Build the sampling settings, letting the request override the model's own.
 fn sampling(
     state: &AppState,
@@ -218,6 +240,15 @@ async fn chat_completions(
         return bad_request("the rendered prompt is empty");
     }
 
+    let max_tokens = match budget(
+        &state,
+        prompt.len(),
+        request.max_completion_tokens.or(request.max_tokens),
+    ) {
+        Ok(n) => n,
+        Err(e) => return bad_request(e),
+    };
+
     let sampling = match sampling(&state, request.temperature, request.top_p, request.top_k) {
         Ok(sampling) => sampling,
         Err(e) => return bad_request(e),
@@ -226,10 +257,7 @@ async fn chat_completions(
     let engine_request = Request {
         prompt,
         sampling,
-        max_tokens: request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .unwrap_or(state.default_max_tokens),
+        max_tokens,
         stop_tokens: state.generation.eos_token_ids.clone(),
         seed: request.seed.unwrap_or_else(default_seed),
     };
@@ -323,6 +351,11 @@ async fn completions(
         return bad_request("the prompt encodes to no tokens");
     }
 
+    let max_tokens = match budget(&state, prompt.len(), request.max_tokens) {
+        Ok(n) => n,
+        Err(e) => return bad_request(e),
+    };
+
     let sampling = match sampling(&state, request.temperature, request.top_p, request.top_k) {
         Ok(sampling) => sampling,
         Err(e) => return bad_request(e),
@@ -331,7 +364,7 @@ async fn completions(
     let events = match state.engine.submit(Request {
         prompt,
         sampling,
-        max_tokens: request.max_tokens.unwrap_or(state.default_max_tokens),
+        max_tokens,
         stop_tokens: state.generation.eos_token_ids.clone(),
         seed: request.seed.unwrap_or_else(default_seed),
     }) {

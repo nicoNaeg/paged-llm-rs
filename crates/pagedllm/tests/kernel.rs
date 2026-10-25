@@ -363,3 +363,67 @@ fn a_pass_that_asks_for_no_logits_runs_on_the_gpu_and_fills_the_cache() {
         "the cache the silent pass filled is wrong: off by {worst:.3e} on values up to {scale:.3e}"
     );
 }
+
+/// The longest context the kernel advertises runs, and one token more is refused.
+///
+/// That number is what the server turns a request away against, so it has to be
+/// the dispatch's own limit: below it the server refuses requests that would
+/// have run, above it one gets in and fails part way through its prompt.
+#[cfg(any(feature = "metal", feature = "cuda"))]
+#[test]
+fn the_kernel_runs_the_longest_context_it_advertises_and_no_more() {
+    let Some(device) = accelerator() else {
+        return;
+    };
+    let (model, _, _) = load_tiny();
+    let config = model.config();
+    let block_size = 16;
+    let limit = pagedllm::kernels::paged_attention::max_context(&device, block_size)
+        .expect("a GPU caps the context");
+    let blocks = limit / block_size + 1;
+    let cache = PagedCache::new(
+        CacheConfig {
+            block_size,
+            blocks,
+            kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            layers: 1,
+        },
+        DType::F32,
+        &device,
+    )
+    .expect("a pool on the accelerator");
+    let (k_pool, v_pool) = cache.layer(0);
+    let q = Tensor::zeros(
+        (1, config.num_attention_heads, config.head_dim),
+        DType::F32,
+        &device,
+    )
+    .unwrap();
+
+    for (context, fits) in [(limit, true), (limit + 1, false)] {
+        let mut allocator = BlockAllocator::new(blocks);
+        let mut table = BlockTable::new(block_size);
+        grow(&mut allocator, &mut table, context);
+        table.advance(context - 1).unwrap();
+        let batch = Batch::new(vec![0], 1, &[&table], block_size).unwrap();
+        let op = pagedllm::PagedAttention::new(
+            k_pool,
+            v_pool,
+            &batch,
+            block_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            1.0,
+        )
+        .unwrap();
+        let ran = op
+            .forward(&q)
+            .is_ok_and(|out| out.flatten_all().and_then(|t| t.to_vec1::<f32>()).is_ok());
+        assert_eq!(
+            ran, fits,
+            "a context of {context} against an advertised {limit}"
+        );
+    }
+}
