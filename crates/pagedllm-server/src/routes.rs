@@ -148,14 +148,12 @@ fn sampling(
 }
 
 /// Pull every event to the end, which is what a non-streamed response needs.
-async fn collect(
-    mut events: UnboundedReceiver<Event>,
-) -> Result<(String, Finish, Usage), Response> {
+async fn collect(mut events: UnboundedReceiver<Event>) -> Result<(String, Finish, Usage), String> {
     let mut text = String::new();
     while let Some(event) = events.recv().await {
         match event {
             Event::Text(chunk) => text.push_str(&chunk),
-            Event::Failed(e) => return Err(server_error(e)),
+            Event::Failed(e) => return Err(e),
             Event::Done {
                 finish,
                 prompt_tokens,
@@ -173,7 +171,7 @@ async fn collect(
             }
         }
     }
-    Err(server_error("the engine stopped without finishing"))
+    Err("the engine stopped without finishing".to_string())
 }
 
 /// Turn the engine's events into server-sent events.
@@ -305,7 +303,7 @@ async fn chat_completions(
     }
 
     match collect(events).await {
-        Err(response) => response,
+        Err(e) => server_error(e),
         Ok((text, finish, usage)) => Json(ChatResponse {
             id,
             object: "chat.completion",
@@ -398,7 +396,7 @@ async fn completions(
     }
 
     match collect(events).await {
-        Err(response) => response,
+        Err(e) => server_error(e),
         Ok((text, finish, usage)) => Json(CompletionResponse {
             id,
             object: "text_completion",
